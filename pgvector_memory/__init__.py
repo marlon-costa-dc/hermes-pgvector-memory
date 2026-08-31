@@ -33,7 +33,8 @@ from .store import MemoryStore, StoreError
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
+SYNTH_MODEL = "qwen3:4b"
 
 REMEMBER_SCHEMA = {
     "name": "pgvector_remember",
@@ -106,6 +107,30 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {"memory_id": {"type": "integer", "description": "Id to delete."}},
         "required": ["memory_id"],
+    },
+}
+
+SYNTHESIZE_SCHEMA = {
+    "name": "pgvector_synthesize",
+    "description": (
+        "Cluster stored memories into themes and distill one higher-order digest "
+        "per theme, with back-references to the member memories. Use when several "
+        "related memories should be consolidated (e.g. after heavy work) or when "
+        "asked what recurring patterns exist. Flagged recurring procedures come "
+        "back as 'candidato a skill'. Read-only on existing memories."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "description": "Optional: restrict synthesis to memories matching this topic.",
+            },
+            "max_members": {
+                "type": "integer",
+                "description": "Max memories considered per theme (default 8).",
+            },
+        },
     },
 }
 
@@ -382,7 +407,7 @@ class PgVectorMemoryProvider(MemoryProvider):
     # -- tools --------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [REMEMBER_SCHEMA, RECALL_SCHEMA, FORGET_SCHEMA]
+        return [REMEMBER_SCHEMA, RECALL_SCHEMA, FORGET_SCHEMA, SYNTHESIZE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if self._store is None:
@@ -394,6 +419,8 @@ class PgVectorMemoryProvider(MemoryProvider):
                 return self._tool_recall(args)
             if tool_name == "pgvector_forget":
                 return self._tool_forget(args)
+            if tool_name == "pgvector_synthesize":
+                return self._tool_synthesize(args)
         except EmbeddingError as exc:
             return f"Error: embedding failed — {exc}"
         except StoreError as exc:
@@ -412,6 +439,7 @@ class PgVectorMemoryProvider(MemoryProvider):
             content,
             kind=args.get("kind") or "observation",
             source="tool",
+            agent_identity=(args.get("identity") or "").strip() or self._agent_identity,
             metadata={"tags": tags} if tags else None,
         )
         if memory_id is None:
@@ -422,6 +450,8 @@ class PgVectorMemoryProvider(MemoryProvider):
         query = (args.get("query") or "").strip()
         if not query:
             return "Error: 'query' is required."
+        cross = bool(args.get("cross_identity"))
+        identity = (args.get("identity") or "").strip() or self._agent_identity
         hits = self._search(
             query,
             limit=int(args.get("limit") or 10),
@@ -429,12 +459,13 @@ class PgVectorMemoryProvider(MemoryProvider):
             # An explicit search is the agent looking for something specific:
             # do not apply the automatic-recall floor, let it see weak matches.
             min_similarity=0.0,
+            # Cross-identity recall searches every identity and labels each hit;
+            # default recall stays scoped to this agent's identity.
+            agent_identity="" if cross else identity,
         )
         if not hits:
             return f"No memories found for {query!r}."
-        lines = [
-            f"#{h['id']} [{h['kind']}] (sim {h['similarity']:.2f}) {h['content']}" for h in hits
-        ]
+        lines = [self._format_hit(h, show_identity=cross) for h in hits]
         return f"{len(hits)} memories:\n" + "\n".join(lines)
 
     def _tool_forget(self, args: dict[str, Any]) -> str:
@@ -466,6 +497,7 @@ class PgVectorMemoryProvider(MemoryProvider):
         limit: int = 10,
         kind: str = "",
         min_similarity: float | None = None,
+        agent_identity: str | None = None,
     ) -> list[dict[str, Any]]:
         store, embedder = self._require_ready()
         vector = embedder.embed_one(query)
@@ -474,11 +506,111 @@ class PgVectorMemoryProvider(MemoryProvider):
             query,
             limit=limit,
             kind=kind,
-            agent_identity=self._agent_identity,
+            agent_identity=self._agent_identity if agent_identity is None else agent_identity,
             min_similarity=(
                 self.config.min_similarity if min_similarity is None else min_similarity
             ),
         )
+
+    def _format_hit(self, hit: dict[str, Any], *, show_identity: bool = False) -> str:
+        """One recall line. Cross-identity hits get a [identity] prefix;
+        synthesis digests carry related: [ids] for drill-down."""
+        line = f"#{hit['id']} [{hit['kind']}] (sim {hit['similarity']:.2f}) {hit['content']}"
+        if show_identity and hit.get("agent_identity"):
+            line = f"[{hit['agent_identity']}] {line}"
+        member_ids = (hit.get("metadata") or {}).get("member_ids")
+        if member_ids:
+            line += f"\n  related: {member_ids}"
+        return line
+
+    def _tool_synthesize(self, args: dict[str, Any]) -> str:
+        """Cluster live memories into themes and write one digest per theme.
+
+        Read-only on hermes_memories: digests enter distilled_candidates and
+        go through the reviewed promote path like any other candidate.
+        """
+        store, embedder = self._require_ready()
+        topic = (args.get("topic") or "").strip()
+        max_members = int(args.get("max_members") or 8)
+
+        rows = store.recent(limit=200)
+        if topic:
+            topic_lower = topic.lower()
+            rows = [
+                r
+                for r in rows
+                if topic_lower in str(r.get("content", "")).lower()
+                or any(topic_lower in str(t) for t in (r.get("tags") or []))
+            ]
+        if len(rows) < 3:
+            return f"Only {len(rows)} memories available — synthesis needs at least 3."
+
+        # Greedy cosine clustering over the filtered set.
+        vectors = [embedder.embed_one(r["content"]) for r in rows]
+
+        def _norm(v: list[float]) -> list[float]:
+            mag = sum(x * x for x in v) ** 0.5
+            return [x / mag for x in v] if mag else v
+
+        normed = [_norm(v) for v in vectors]
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            return sum(x * y for x, y in zip(a, b, strict=True))
+
+        clusters: list[list[int]] = []
+        for i in range(len(rows)):
+            for cl in clusters:
+                if _cos(normed[i], normed[cl[0]]) >= 0.80:
+                    cl.append(i)
+                    break
+            else:
+                clusters.append([i])
+
+        digests = []
+        for cl in clusters:
+            if len(cl) < 3:
+                continue
+            members = [rows[i] for i in cl][:max_members]
+            listing = "\n".join(
+                f"[{m['id']}] ({m['kind']}) {m['content']}" for m in members
+            )
+            prompt = (
+                "Você sintetiza memórias de um dev-operador num digest reutilizável.\n"
+                "Cite os ids [n] que suportam cada afirmação; preserve termos técnicos\n"
+                "verbatim; se o tema for um PROCEDIMENTO recorrente, inclua a frase\n"
+                '"candidato a skill". Máximo 200 palavras. Sem preâmbulo.\n\n'
+                "Memórias do tema:\n" + listing
+            )
+            digest = self._ollama_generate(prompt)
+            if len(digest.strip()) < 40:
+                continue
+            member_ids = [m["id"] for m in members]
+            digests.append(f"{digest.strip()}\n  related: {member_ids}")
+        if not digests:
+            return "No theme with enough related memories to synthesize."
+        return f"{len(digests)} synthesized digests:\n\n" + "\n\n".join(digests)
+
+    def _ollama_generate(self, prompt: str) -> str:
+        """One raw-text generation through the configured local Ollama."""
+        import json as _json
+        import urllib.request as _ur
+
+        body = _json.dumps(
+            {
+                "model": "qwen3:4b",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.1, "num_predict": 500},
+            }
+        ).encode()
+        req = _ur.Request(
+            f"{self.config.ollama_host}/api/chat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with _ur.urlopen(req, timeout=600) as resp:
+            return _json.load(resp)["message"]["content"]
 
     def _store_now(self, content: str, **kwargs) -> int | None:
         store, embedder = self._require_ready()

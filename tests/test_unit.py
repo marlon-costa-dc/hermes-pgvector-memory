@@ -306,3 +306,82 @@ class TestNoiseFilter:
         assert not _is_noisy_user_text("Como configuro o gateway?")
         assert not _is_noisy_user_text("roda os testes de integracao")
         assert not _is_noisy_user_text("why did the deploy fail?")
+
+
+class TestSynthesizeToolAndIdentity:
+    def _provider(self, **cfg_overrides):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+        from pgvector_memory.store import MemoryStore
+
+        cfg = Config(**cfg_overrides)
+        p = PgVectorMemoryProvider(cfg)
+        p._store = MemoryStore.__new__(MemoryStore)
+        return p
+
+    def test_four_tool_schemas(self):
+        p = self._provider()
+        names = [s["name"] for s in p.get_tool_schemas()]
+        assert names == [
+            "pgvector_remember",
+            "pgvector_recall",
+            "pgvector_forget",
+            "pgvector_synthesize",
+        ]
+
+    def test_recall_accepts_identity_and_cross_identity_args(self):
+        """cross_identity=True widens the search to ALL identities."""
+        p = self._provider(dsn="postgresql:///x")
+        captured = {}
+
+        def fake_search(query, *, limit=10, kind="", min_similarity=None,
+                        agent_identity=None):
+            captured["agent_identity"] = agent_identity
+            return []
+
+        p._search = fake_search  # type: ignore[method-assign]
+        p.handle_tool_call("pgvector_recall", {
+            "query": "gateway", "identity": "work", "cross_identity": True,
+        })
+        assert captured["agent_identity"] == ""  # all identities
+
+        captured.clear()
+        p.handle_tool_call("pgvector_recall", {"query": "gateway", "identity": "work"})
+        assert captured["agent_identity"] == "work"  # scoped
+
+    def test_remember_accepts_identity(self):
+        p = self._provider(dsn="postgresql:///x")
+        captured = {}
+
+        def fake_store_now(content, **kw):
+            captured.update(kw)
+            return 42
+
+        p._store_now = fake_store_now  # type: ignore[method-assign]
+        out = p.handle_tool_call("pgvector_remember", {
+            "content": "fato", "identity": "work",
+        })
+        assert "42" in out
+        assert captured.get("agent_identity") == "work"
+
+    def test_synthesize_tool_requires_ready_store(self):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        p = PgVectorMemoryProvider(Config(dsn="postgresql:///x"))
+        out = p.handle_tool_call("pgvector_synthesize", {"topic": "x"})
+        assert "not initialized" in out
+
+    def test_related_ids_appended_to_recall_output(self):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        p = PgVectorMemoryProvider(Config(dsn="postgresql:///x"))
+        hits = [
+            {"id": 7, "kind": "observation", "similarity": 0.9,
+             "content": "digest", "metadata": {"member_ids": [1, 2, 3]}},
+            {"id": 8, "kind": "fact", "similarity": 0.8, "content": "plain"},
+        ]
+        lines = [p._format_hit(h) for h in hits]
+        assert "related: [1, 2, 3]" in lines[0]
+        assert "related" not in lines[1]
