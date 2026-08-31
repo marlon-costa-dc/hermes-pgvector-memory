@@ -16,7 +16,7 @@ go through the same promote path with dedupe and triple-key supersession.
 Idempotent: an identical digest hash is a no-op, and synthesis never seeds a
 new synthesis (source <> 'synthesis' in the seed query) so themes cannot cascade.
 
-    python3 scripts/synthesize.py [--dsn ...] [--ollama ...] [--model qwen3:4b]
+    python3 scripts/synthesize.py [--dsn ...] [--ollama ...] [--model phi4-mini]
                                   [--thresh 0.82] [--min-size 3] [--limit 400]
                                   [--dry-run]
 """
@@ -39,7 +39,7 @@ from distill_prompts import (  # noqa: E402
     _strip_fences,
 )
 
-DISTILL_MODEL_DEFAULT = "qwen3:4b"
+DISTILL_MODEL_DEFAULT = "phi4-mini"
 
 THEME_SEEDS_SQL = """
 WITH seeds AS (
@@ -167,7 +167,9 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     if args.dry_run:
         for t in themes:
-            listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content'][:80]}" for m in t["members"])
+            listing = "\n".join(
+                f"[{m['id']}] ({m['kind']}) {m['content'][:80]}" for m in t["members"]
+            )
             print(f"--- theme seed={t['seed_id']} members={t['member_ids']}")
             print(listing)
         return
@@ -178,9 +180,7 @@ def main() -> None:
     _ensure_schema(conn)
     proposed = 0
     for t in themes:
-        listing = "\n".join(
-            f"[{m['id']}] ({m['kind']}) {m['content']}" for m in t["members"]
-        )
+        listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content']}" for m in t["members"])
         raw = _ollama_chat(
             args.ollama,
             args.model,
@@ -209,9 +209,7 @@ def main() -> None:
                     _sha(row["content"]),
                     args.model,
                     row["content"],
-                    json.dumps(
-                        {"member_ids": row["member_ids"], "theme_seed": row["theme_seed"]}
-                    ),
+                    json.dumps({"member_ids": row["member_ids"], "theme_seed": row["theme_seed"]}),
                 ),
             )
             # member_ids/theme_seed live in tags+metadata path: keep them also
