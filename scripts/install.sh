@@ -58,9 +58,24 @@ cp -r "$REPO_DIR/sql" "$PLUGIN_DIR/sql"
 info "Installing the psycopg driver into the Hermes venv"
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 if [ -x "$HERMES_PY" ]; then
-  "$HERMES_PY" -m pip install --quiet "psycopg[binary]>=3.1" \
-    && info "psycopg installed" \
-    || warn "pip failed — install manually: $HERMES_PY -m pip install 'psycopg[binary]'"
+  # The Hermes venv is uv-managed and ships no pip, so `python -m pip` fails
+  # with "No module named pip". Try uv first, fall back to pip for installs
+  # that do have it.
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --quiet --python "$HERMES_PY" "psycopg[binary]>=3.1" || true
+  else
+    "$HERMES_PY" -m pip install --quiet "psycopg[binary]>=3.1" || true
+  fi
+
+  # Verify by IMPORTING, never by trusting the installer's exit code: the
+  # previous version printed "psycopg installed" while the venv had no pip
+  # and nothing had been installed at all.
+  if "$HERMES_PY" -c 'import psycopg' 2>/dev/null; then
+    info "psycopg verified: $("$HERMES_PY" -c 'import psycopg; print(psycopg.__version__)')"
+  else
+    die "psycopg is still not importable by $HERMES_PY.
+    Install it manually:  uv pip install --python $HERMES_PY 'psycopg[binary]'"
+  fi
 else
   warn "Hermes venv not found at $HERMES_PY — install 'psycopg[binary]' yourself"
 fi
