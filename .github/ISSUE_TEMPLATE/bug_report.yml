@@ -1,0 +1,50 @@
+name: Bug report
+description: Something behaves incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Paste the actual error or output, not a paraphrase of it.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of the commands below.
+      value: |
+        psql -tAc 'select version()'
+        psql -d hermes_memory -tAc "select extname, extversion from pg_extension order by 1"
+        psql -d hermes_memory -tAc "select amname from pg_am where amname='diskann'"
+        ollama --version
+        python --version
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: memory-status
+    attributes:
+      label: hermes memory status
+      render: shell
