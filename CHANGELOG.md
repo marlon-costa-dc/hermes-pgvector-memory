@@ -7,6 +7,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-31
+
+Migrating the operator's real `MEMORY.md` into the database and then querying
+it exposed two bugs that unit tests could not: the corpus is telegraphic,
+mixes Portuguese with English and code identifiers, and asks questions in
+prose. Recall on it went from 2/5 to 5/7.
+
+### Added
+
+- `scripts/import_builtin_memory.py` — backfills Hermes' built-in
+  `MEMORY.md` / `USER.md` into PostgreSQL. `mirror_memory_tool` only captures
+  *future* writes, so everything the files already held stayed invisible to
+  semantic recall. Measured on a live install: 23 rows in the database, none
+  with `source='memory_tool'`, while the files held 16 entries. Splits on the
+  `§` separator, embeds in one batch, and relies on the content-hash index for
+  idempotence (second run: `Imported 0, skipped 16`).
+
+### Fixed
+
+- **The lexical half of hybrid search never matched a natural-language
+  question.** `plainto_tsquery` ANDs every term and the `simple` config strips
+  no stopwords, so *"quem e o dono da branch e do merge?"* compiled to
+  `'quem' & 'e' & 'o' & 'dono' & 'da' & 'branch' & 'e' & 'do' & 'merge'` and
+  matched nothing at all. Queries are now built as an OR of their own lexemes,
+  with single-character tokens dropped — `'o'` alone matched 12 of 23 rows.
+- **Slash- and dot-separated technical terms were unsearchable.** Postgres'
+  parser reads `branch/worktree/gates/PR/merge` as a single `file` token, so
+  searching "merge" or "worktree" missed it. Content is now indexed twice —
+  verbatim plus a punctuation-normalised copy — and the query is normalised
+  with the same expression, because splitting only the document side left
+  `CLAUDE.md` in a query matching zero rows against a document holding
+  `claude` + `md`.
+- **`install.sh` reported success over a broken install.** The Hermes venv is
+  uv-managed and ships no pip, so `python -m pip install` failed with
+  `No module named pip`; the error was swallowed by `|| warn` and the script
+  printed "psycopg installed" while the provider was dead
+  (`available: False`). It now uses `uv` when present and verifies by
+  *importing* the module — an installer's exit code proves nothing.
+
+### Known limitation
+
+Two of seven probe queries still fail, and no code change fixes them: they
+need causal inference rather than similarity. *"Por que o /home encheu?"*
+should retrieve a memory stating `bd list --all` is 17.7 GB, with which it
+shares no vocabulary. `bge-m3` (multilingual, 1024-dim) was measured on
+exactly these cases and fails them too, so this is not an embedding-model
+choice.
+
 ## [0.1.0] — 2026-08-31
 
 First release. Verified end to end against a live stack: PostgreSQL 18.6,
@@ -58,5 +106,6 @@ serving `nomic-embed-text`.
   invariant (every relevant hit outranks every irrelevant one), which holds
   across all probe queries.
 
-[Unreleased]: https://github.com/marlon-costa-dc/hermes-pgvector-memory/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/marlon-costa-dc/hermes-pgvector-memory/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/marlon-costa-dc/hermes-pgvector-memory/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/marlon-costa-dc/hermes-pgvector-memory/releases/tag/v0.1.0
