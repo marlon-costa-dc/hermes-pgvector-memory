@@ -37,7 +37,7 @@ from typing import Any
 
 DSN_DEFAULT = "postgresql:///hermes_memory?host=/run/postgresql"
 EMBED_MODEL_DEFAULT = "nomic-embed-text"
-DISTILL_MODEL_DEFAULT = "qwen3:4b"
+DISTILL_MODEL_DEFAULT = "phi4-mini"
 OLLAMA_DEFAULT = "http://127.0.0.1:11434"
 
 # Prompts shorter than this carry no distillable intent ("ok", "?", "siga").
