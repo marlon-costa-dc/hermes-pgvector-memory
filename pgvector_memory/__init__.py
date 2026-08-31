@@ -571,9 +571,7 @@ class PgVectorMemoryProvider(MemoryProvider):
             if len(cl) < 3:
                 continue
             members = [rows[i] for i in cl][:max_members]
-            listing = "\n".join(
-                f"[{m['id']}] ({m['kind']}) {m['content']}" for m in members
-            )
+            listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content']}" for m in members)
             prompt = (
                 "Você sintetiza memórias de um dev-operador num digest reutilizável.\n"
                 "Cite os ids [n] que suportam cada afirmação; preserve termos técnicos\n"

@@ -334,15 +334,19 @@ class TestSynthesizeToolAndIdentity:
         p = self._provider(dsn="postgresql:///x")
         captured = {}
 
-        def fake_search(query, *, limit=10, kind="", min_similarity=None,
-                        agent_identity=None):
+        def fake_search(query, *, limit=10, kind="", min_similarity=None, agent_identity=None):
             captured["agent_identity"] = agent_identity
             return []
 
         p._search = fake_search  # type: ignore[method-assign]
-        p.handle_tool_call("pgvector_recall", {
-            "query": "gateway", "identity": "work", "cross_identity": True,
-        })
+        p.handle_tool_call(
+            "pgvector_recall",
+            {
+                "query": "gateway",
+                "identity": "work",
+                "cross_identity": True,
+            },
+        )
         assert captured["agent_identity"] == ""  # all identities
 
         captured.clear()
@@ -358,9 +362,13 @@ class TestSynthesizeToolAndIdentity:
             return 42
 
         p._store_now = fake_store_now  # type: ignore[method-assign]
-        out = p.handle_tool_call("pgvector_remember", {
-            "content": "fato", "identity": "work",
-        })
+        out = p.handle_tool_call(
+            "pgvector_remember",
+            {
+                "content": "fato",
+                "identity": "work",
+            },
+        )
         assert "42" in out
         assert captured.get("agent_identity") == "work"
 
@@ -378,8 +386,13 @@ class TestSynthesizeToolAndIdentity:
 
         p = PgVectorMemoryProvider(Config(dsn="postgresql:///x"))
         hits = [
-            {"id": 7, "kind": "observation", "similarity": 0.9,
-             "content": "digest", "metadata": {"member_ids": [1, 2, 3]}},
+            {
+                "id": 7,
+                "kind": "observation",
+                "similarity": 0.9,
+                "content": "digest",
+                "metadata": {"member_ids": [1, 2, 3]},
+            },
             {"id": 8, "kind": "fact", "similarity": 0.8, "content": "plain"},
         ]
         lines = [p._format_hit(h) for h in hits]

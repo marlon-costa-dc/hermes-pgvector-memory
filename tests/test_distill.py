@@ -124,14 +124,18 @@ class TestParseEnrichment:
 class TestPromoteDecision:
     def test_triple_conflict_supersedes(self):
         decision, old_id = _promote_decision(
-            subject="bd", relation="versao", obj="1.2.2",
+            subject="bd",
+            relation="versao",
+            obj="1.2.2",
             live_key_hit=(77, "1.2.1"),
         )
         assert decision == "supersede" and old_id == 77
 
     def test_triple_same_object_is_duplicate(self):
         decision, _ = _promote_decision(
-            subject="bd", relation="versao", obj="1.2.2",
+            subject="bd",
+            relation="versao",
+            obj="1.2.2",
             live_key_hit=(77, "1.2.2"),
         )
         assert decision == "skip"
@@ -158,7 +162,10 @@ class TestPromoteDecision:
         # The MemStrata point: without a structural key, similarity alone can
         # NEVER retire a memory — similarity cannot tell duplicate from conflict.
         decision, old_id = _promote_decision(
-            subject="", relation="", obj="", live_key_hit=(5, "qualquer"),
+            subject="",
+            relation="",
+            obj="",
+            live_key_hit=(5, "qualquer"),
             best_similarity=0.99,
         )
         assert decision in ("skip", "insert")
@@ -184,7 +191,11 @@ class TestClusterCandidates:
 
         cands = [
             {"core": "curto", "embedding": [1.0, 0.0], "prompt_ids": [1]},
-            {"core": "um core bem mais longo e detalhado aqui", "embedding": [0.99, 0.01], "prompt_ids": [2]},
+            {
+                "core": "um core bem mais longo e detalhado aqui",
+                "embedding": [0.99, 0.01],
+                "prompt_ids": [2],
+            },
         ]
         clusters = _cluster_candidates(cands, thresh=0.90)
         assert len(clusters) == 1
@@ -194,10 +205,28 @@ class TestClusterCandidates:
         from distill_prompts import _cluster_candidates
 
         cands = [
-            {"core": "a", "embedding": [1.0, 0.0], "prompt_ids": [1],
-             "specific_context": "ctx-a", "tags": ["x"], "subject": "", "relation": "", "object": "", "kind": "fact"},
-            {"core": "b", "embedding": [0.99, 0.0], "prompt_ids": [2],
-             "specific_context": "ctx-b", "tags": ["y"], "subject": "s", "relation": "r", "object": "o", "kind": "fact"},
+            {
+                "core": "a",
+                "embedding": [1.0, 0.0],
+                "prompt_ids": [1],
+                "specific_context": "ctx-a",
+                "tags": ["x"],
+                "subject": "",
+                "relation": "",
+                "object": "",
+                "kind": "fact",
+            },
+            {
+                "core": "b",
+                "embedding": [0.99, 0.0],
+                "prompt_ids": [2],
+                "specific_context": "ctx-b",
+                "tags": ["y"],
+                "subject": "s",
+                "relation": "r",
+                "object": "o",
+                "kind": "fact",
+            },
         ]
         (merged,) = _cluster_candidates(cands, thresh=0.90)
         assert merged["tags"] == ["x", "y"]

@@ -167,7 +167,9 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     if args.dry_run:
         for t in themes:
-            listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content'][:80]}" for m in t["members"])
+            listing = "\n".join(
+                f"[{m['id']}] ({m['kind']}) {m['content'][:80]}" for m in t["members"]
+            )
             print(f"--- theme seed={t['seed_id']} members={t['member_ids']}")
             print(listing)
         return
@@ -178,9 +180,7 @@ def main() -> None:
     _ensure_schema(conn)
     proposed = 0
     for t in themes:
-        listing = "\n".join(
-            f"[{m['id']}] ({m['kind']}) {m['content']}" for m in t["members"]
-        )
+        listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content']}" for m in t["members"])
         raw = _ollama_chat(
             args.ollama,
             args.model,
@@ -209,9 +209,7 @@ def main() -> None:
                     _sha(row["content"]),
                     args.model,
                     row["content"],
-                    json.dumps(
-                        {"member_ids": row["member_ids"], "theme_seed": row["theme_seed"]}
-                    ),
+                    json.dumps({"member_ids": row["member_ids"], "theme_seed": row["theme_seed"]}),
                 ),
             )
             # member_ids/theme_seed live in tags+metadata path: keep them also

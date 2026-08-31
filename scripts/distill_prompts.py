@@ -251,9 +251,7 @@ def _parse_enrichment(raw: str) -> dict[str, Any]:
     }
 
 
-def _cluster_candidates(
-    cands: list[dict[str, Any]], thresh: float = 0.90
-) -> list[dict[str, Any]]:
+def _cluster_candidates(cands: list[dict[str, Any]], thresh: float = 0.90) -> list[dict[str, Any]]:
     """Greedy cosine clustering of one distill batch's candidates.
 
     n is tiny (<= 4 per batch), so O(n^2) greedy is right and a real
@@ -262,6 +260,7 @@ def _cluster_candidates(
     tags union; specific_context keeps the first non-empty; a triple from any
     member survives, so supersession power is not lost to a merge.
     """
+
     def _norm(v: list[float]) -> list[float]:
         mag = sum(x * x for x in v) ** 0.5
         return [x / mag for x in v] if mag else v
@@ -275,7 +274,9 @@ def _cluster_candidates(
         emb = _norm([float(x) for x in cand.get("embedding") or []])
         for cl in clusters:
             members = cl["_members"]
-            ref = members[0].get("_emb") or _norm([float(x) for x in members[0].get("embedding") or []])
+            ref = members[0].get("_emb") or _norm(
+                [float(x) for x in members[0].get("embedding") or []]
+            )
             if _cos(emb, ref) >= thresh:
                 members.append(cand)
                 cand["_emb"] = emb

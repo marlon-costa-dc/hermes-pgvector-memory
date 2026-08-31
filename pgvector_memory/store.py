@@ -289,9 +289,20 @@ class MemoryStore:
         if row is None:
             return None
         keys = (
-            "id", "content", "kind", "source", "session_id", "agent_identity",
-            "metadata", "specific_context", "tags", "subject", "relation",
-            "object", "superseded_at", "superseded_by",
+            "id",
+            "content",
+            "kind",
+            "source",
+            "session_id",
+            "agent_identity",
+            "metadata",
+            "specific_context",
+            "tags",
+            "subject",
+            "relation",
+            "object",
+            "superseded_at",
+            "superseded_by",
         )
         return dict(zip(keys, row, strict=True))
 
