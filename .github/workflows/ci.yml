@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check .
+      - run: uvx ruff format --check --diff .
+
+  unit:
+    # No database, no Ollama: the layers that must pass everywhere.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest 'psycopg[binary]'
+      - run: pytest tests/test_unit.py tests/test_contract.py -v
+
+  integration:
+    # Real PostgreSQL with pgvector + pgvectorscale, real embeddings.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: hermes_memory
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGVECTOR_MEMORY_DSN: postgresql://postgres:postgres@localhost:5432/hermes_memory
+      PGVECTOR_MEMORY_OLLAMA_HOST: http://127.0.0.1:11434
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Enable extensions
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          PGPASSWORD=postgres psql -h localhost -U postgres -d hermes_memory \
+            -c 'CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE;'
+          PGPASSWORD=postgres psql -h localhost -U postgres -d hermes_memory \
+            -c "SELECT amname FROM pg_am WHERE amname='diskann';"
+
+      - name: Install and warm up Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && break
+            sleep 2
+          done
+          ollama pull nomic-embed-text
+
+      - run: pip install pytest 'psycopg[binary]'
+
+      - name: Integration tests (must not skip)
+        run: |
+          # This job exists to exercise a REAL stack. A silent skip would hide
+          # a broken database or embedder and still report the build green,
+          # so treat any skip as a failure.
+          set -euo pipefail
+          pytest tests/test_integration.py -v -rs | tee out.txt
+          if grep -qE '[0-9]+ skipped' out.txt; then
+            echo "::error::Integration tests skipped — the stack did not come up"
+            exit 1
+          fi

@@ -1,0 +1,10 @@
+name: pgvector-memory
+version: "0.1.0"
+description: "PostgreSQL memory provider — pgvector + pgvectorscale DiskANN, embeddings served locally by Ollama."
+author: Marlon Costa <marlon.costa@datacosmos.com.br>
+homepage: https://github.com/marlon-costa-dc/hermes-pgvector-memory
+license: MIT
+pip_dependencies:
+  - "psycopg[binary]>=3.1"
+hooks:
+  - on_session_end

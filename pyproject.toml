@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-pgvector-memory"
+version = "0.1.0"
+description = "PostgreSQL memory provider for Hermes Agent — pgvector + pgvectorscale DiskANN with local Ollama embeddings"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Marlon Costa", email = "marlon.costa@datacosmos.com.br" }]
+keywords = ["hermes", "agent", "memory", "pgvector", "pgvectorscale", "rag", "ollama"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["psycopg[binary]>=3.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/marlon-costa-dc/hermes-pgvector-memory"
+Issues = "https://github.com/marlon-costa-dc/hermes-pgvector-memory/issues"
+
+# Discovered by Hermes' entry-point provider loader, as an alternative to
+# copying the package into $HERMES_HOME/plugins/.
+[project.entry-points."hermes.memory_providers"]
+pgvector-memory = "pgvector_memory"
+
+[tool.setuptools]
+packages = ["pgvector_memory"]
+
+[tool.setuptools.package-data]
+pgvector_memory = ["sql/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # long lines are prose in docstrings and SQL
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]  # sys.path juggling must precede imports
+# conftest mirrors the host's real ABC, where these hooks are deliberately
+# non-abstract (a provider overrides only what it needs). Marking them
+# abstract would make the stub diverge from what it stands in for.
+"tests/conftest.py" = ["E402", "B027"]

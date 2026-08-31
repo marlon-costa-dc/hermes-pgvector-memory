@@ -1,0 +1,124 @@
+"""Unit tests that need no PostgreSQL and no Ollama.
+
+Everything here is pure logic: config precedence, vector rendering, hashing,
+SQL shape. Tests that require the real stack live in test_integration.py and
+skip themselves when it is absent.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pgvector_memory.config import Config, load_config  # noqa: E402
+from pgvector_memory.embeddings import KNOWN_DIMS, OllamaEmbedder, to_pgvector  # noqa: E402
+from pgvector_memory.store import MemoryStore, StoreError, _sha256  # noqa: E402
+
+
+class TestToPgvector:
+    def test_renders_bracketed_csv(self):
+        assert to_pgvector([1.0, 2.0, 3.0]) == "[1.000000,2.000000,3.000000]"
+
+    def test_negative_and_small_values_keep_sign_and_scale(self):
+        out = to_pgvector([-0.5, 0.000001, -0.0000001])
+        assert out.startswith("[-0.500000,")
+        # 1e-7 rounds to zero at 6 decimals; that is intentional (pgvector
+        # stores float4 anyway) but must not become "-0.000000e-07" garbage.
+        assert "e" not in out
+
+    def test_empty_vector(self):
+        assert to_pgvector([]) == "[]"
+
+
+class TestConfig:
+    def test_defaults_are_conservative(self):
+        cfg = Config()
+        # Turn capture defaults OFF: it is lossy and grows the table fast.
+        assert cfg.auto_capture_turns is False
+        assert cfg.auto_recall is True
+        assert cfg.mirror_memory_tool is True
+
+    def test_env_overrides_config_yaml(self, monkeypatch):
+        monkeypatch.setenv("PGVECTOR_MEMORY_DSN", "postgresql://from-env/db")
+        cfg = load_config(cfg_get=lambda key, default=None: "postgresql://from-yaml/db")
+        assert cfg.dsn == "postgresql://from-env/db"
+
+    def test_config_yaml_used_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("PGVECTOR_MEMORY_DSN", raising=False)
+
+        def fake_cfg(key, default=None):
+            return "postgresql://from-yaml/db" if key.endswith(".dsn") else default
+
+        assert load_config(cfg_get=fake_cfg).dsn == "postgresql://from-yaml/db"
+
+    def test_falls_back_to_defaults_without_host_config(self, monkeypatch):
+        for var in list(os.environ):
+            if var.startswith("PGVECTOR_MEMORY_"):
+                monkeypatch.delenv(var, raising=False)
+        cfg = load_config(cfg_get=None)
+        assert cfg.dsn.endswith("host=/run/postgresql")
+        assert cfg.embed_model == "nomic-embed-text"
+
+    def test_broken_cfg_get_does_not_crash_startup(self, monkeypatch):
+        monkeypatch.delenv("PGVECTOR_MEMORY_DSN", raising=False)
+
+        def exploding(key, default=None):
+            raise RuntimeError("config backend down")
+
+        # A memory plugin must not take the whole agent down over config.
+        assert load_config(cfg_get=exploding).dsn == Config().dsn
+
+
+class TestStoreValidation:
+    def test_rejects_table_name_carrying_sql(self):
+        # Table is an identifier, so it cannot be a bound parameter; the
+        # guard is the only thing standing between config and injection.
+        with pytest.raises(StoreError):
+            MemoryStore("postgresql:///x", 768, table="users; DROP TABLE x")
+
+    def test_rejects_quoted_identifier(self):
+        with pytest.raises(StoreError):
+            MemoryStore("postgresql:///x", 768, table='a" OR "1"="1')
+
+    def test_accepts_plain_identifier(self):
+        assert MemoryStore("postgresql:///x", 768, table="my_memories").table == "my_memories"
+
+    def test_operations_before_connect_fail_loudly(self):
+        store = MemoryStore("postgresql:///x", 768)
+        with pytest.raises(StoreError, match="not connected"):
+            store.recent()
+
+
+class TestHashing:
+    def test_same_content_same_hash(self):
+        assert _sha256("hello") == _sha256("hello")
+
+    def test_different_content_different_hash(self):
+        assert _sha256("hello") != _sha256("hello ")
+
+    def test_unicode_is_stable(self):
+        assert len(_sha256("memória vetorial 🇧🇷")) == 32
+
+
+class TestEmbedderContract:
+    def test_known_dims_match_documented_models(self):
+        assert KNOWN_DIMS["nomic-embed-text"] == 768
+        assert KNOWN_DIMS["all-minilm"] == 384
+
+    def test_unknown_model_has_no_preset_dims(self):
+        assert OllamaEmbedder(model="some-future-model").dims is None
+
+    def test_known_model_preloads_dims(self):
+        assert OllamaEmbedder(model="nomic-embed-text").dims == 768
+
+    def test_host_trailing_slash_normalised(self):
+        assert OllamaEmbedder(host="http://localhost:11434/").host == "http://localhost:11434"
+
+    def test_embed_empty_list_short_circuits(self):
+        # Must not perform a request for an empty batch.
+        assert OllamaEmbedder().embed([]) == []
