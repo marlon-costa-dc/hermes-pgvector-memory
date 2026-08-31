@@ -49,8 +49,17 @@ CREATE INDEX IF NOT EXISTS hermes_memories_diskann
 -- Lexical half of hybrid search. 'simple' rather than a language-specific
 -- dictionary on purpose: memories mix Portuguese, English, code identifiers
 -- and file paths, and stemming any one of those hurts the others.
+--
+-- The content is indexed TWICE: verbatim, plus a copy with punctuation
+-- replaced by spaces. Postgres' parser classifies "branch/worktree/gates/merge"
+-- as a single `file` token, so a search for "merge" would not match it --
+-- measured on this corpus, where slash- and dot-separated technical notation
+-- is everywhere. The second copy splits those into individual lexemes while
+-- the first keeps the whole path searchable as one term.
 CREATE INDEX IF NOT EXISTS hermes_memories_fts
-    ON hermes_memories USING gin (to_tsvector('simple', content));
+    ON hermes_memories USING gin (
+        to_tsvector('simple', content || ' ' || translate(content, '/_-.:', '     '))
+    );
 
 CREATE INDEX IF NOT EXISTS hermes_memories_created_at
     ON hermes_memories (created_at DESC);

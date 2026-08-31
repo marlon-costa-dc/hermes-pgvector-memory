@@ -39,6 +39,20 @@ serving `nomic-embed-text`.
 
 ### Fixed
 
+- **The lexical half of hybrid search never matched a natural-language
+  question.** `plainto_tsquery` ANDs every term and the `simple` config strips
+  no stopwords, so *"quem e o dono da branch e do merge?"* compiled to
+  `'quem' & 'e' & 'o' & 'dono' & 'da' & 'branch' & 'e' & 'do' & 'merge'` and
+  matched nothing at all. Queries are now built as an OR of their own lexemes,
+  with single-character tokens dropped — `'o'` alone matched 12 of 23 rows.
+- **Slash- and dot-separated technical terms were unsearchable.** Postgres'
+  parser reads `branch/worktree/gates/PR/merge` as a single `file` token, so
+  searching "merge" or "worktree" missed it. Content is now indexed twice —
+  verbatim plus a punctuation-normalised copy — and the query is normalised
+  with the same expression, because splitting only the document side left
+  `CLAUDE.md` in a query matching zero rows against a document holding
+  `claude` + `md`.
+
 - Defaults were not applied when the host's `cfg_get` returned `None`.
   Hermes' `cfg_get(key, default)` yields `None` for an unset key — it does not
   apply the default. Trusting the documented signature left `ollama_host=None`
