@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # rank 40 vs 41.
 RRF_K = 60
 
+# Expression indexed by hermes_memories_fts. Content is tokenised twice:
+# verbatim, plus a copy with punctuation turned into spaces, because the
+# Postgres parser reads "branch/worktree/gates/merge" as ONE `file` token and
+# a search for "merge" would otherwise miss it. Must stay byte-identical to
+# the index expression in sql/schema.sql or the planner cannot use the index.
+_FTS_EXPR = "to_tsvector('simple', {col} || ' ' || translate({col}, '/_-.:', '     '))"
+
 
 class StoreError(RuntimeError):
     """Raised for unrecoverable storage problems (bad config, missing deps)."""
@@ -217,14 +224,18 @@ class MemoryStore:
 
         # Build the optional filter as a predicate (never a bare WHERE) so it
         # can be AND-ed into any position without rewriting the statement.
-        preds, params = ["TRUE"], []
+        # Two variants: unqualified, and qualified for the aliased CTE.
+        preds, qual_preds, params = ["TRUE"], ["TRUE"], []
         if kind:
             preds.append("kind = %s")
+            qual_preds.append("m.kind = %s")
             params.append(kind)
         if agent_identity:
             preds.append("agent_identity = %s")
+            qual_preds.append("m.agent_identity = %s")
             params.append(agent_identity)
         filter_sql = " AND ".join(preds)
+        qual_filter_sql = " AND ".join(qual_preds)
 
         vec = to_pgvector(query_embedding)
         # Over-fetch per branch so fusion has candidates to work with: a row
@@ -232,8 +243,36 @@ class MemoryStore:
         pool = max(limit * 5, 50)
 
         if query_text.strip():
+            fts_doc = _FTS_EXPR.format(col="m.content")
+            # Two bugs this replaces, both measured on the real corpus:
+            #
+            # 1. plainto_tsquery ANDs every term and the 'simple' config
+            #    strips no stopwords, so "quem e o dono da branch" became
+            #    'quem' & 'e' & 'o' & 'dono' & 'da' & 'branch' and matched
+            #    nothing at all. An OR of the lexemes is what makes
+            #    natural-language recall work; ts_rank still rewards
+            #    documents matching more of them.
+            #
+            # 2. The query must be normalised EXACTLY like the document, or
+            #    the halves disagree: the indexed side splits "CLAUDE.md"
+            #    into 'claude'+'md', while a raw query keeps 'claude.md' as
+            #    one lexeme that then matches zero rows.
+            #
+            # Single-character lexemes are dropped: in 'simple' every
+            # stopword survives, and "o" alone matched 12 of 23 rows here,
+            # drowning the terms that carry meaning.
+            fts_query = (
+                "to_tsquery('simple', array_to_string(ARRAY("
+                "  SELECT lex FROM unnest(tsvector_to_array("
+                f"    {_FTS_EXPR.format(col='%s')}"
+                "  )) AS lex WHERE length(lex) > 1"
+                "), ' | '))"
+            )
             sql = f"""
-            WITH vector_hits AS (
+            WITH lexical_query AS (
+                SELECT {fts_query} AS q
+            ),
+            vector_hits AS (
                 SELECT id, row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank
                   FROM {self.table}
                  WHERE {filter_sql}
@@ -241,13 +280,12 @@ class MemoryStore:
                  LIMIT {pool}
             ),
             lexical_hits AS (
-                SELECT id, row_number() OVER (
-                           ORDER BY ts_rank(to_tsvector('simple', content),
-                                            plainto_tsquery('simple', %s)) DESC
+                SELECT m.id, row_number() OVER (
+                           ORDER BY ts_rank({fts_doc}, lq.q) DESC
                        ) AS rank
-                  FROM {self.table}
-                 WHERE {filter_sql}
-                   AND to_tsvector('simple', content) @@ plainto_tsquery('simple', %s)
+                  FROM {self.table} m, lexical_query lq
+                 WHERE {qual_filter_sql}
+                   AND {_FTS_EXPR.format(col="m.content")} @@ lq.q
                  LIMIT {pool}
             ),
             fused AS (
@@ -266,12 +304,14 @@ class MemoryStore:
              LIMIT %s
             """
             args = [
+                # _FTS_EXPR interpolates {col} twice, so the query text is
+                # bound twice in the lexical_query CTE.
+                query_text,
+                query_text,
                 vec,
                 *params,  # vector_hits: rank window + filter
-                vec,  #              ORDER BY
-                query_text,
-                *params,  # lexical_hits: ts_rank + filter
-                query_text,  #               @@ predicate
+                vec,  # ORDER BY
+                *params,  # lexical_hits filter
                 vec,
                 vec,
                 min_similarity,
