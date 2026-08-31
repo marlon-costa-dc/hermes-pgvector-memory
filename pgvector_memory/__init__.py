@@ -376,7 +376,12 @@ class PgVectorMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.warning("pgvector-memory staging enqueue failed: %s", exc)
 
-        threading.Thread(target=_work, daemon=True, name="pgvec-staging").start()
+        # Non-daemon: `hermes chat -q` exits right after printing the response,
+        # and a daemon thread dies with the process — the enqueue loses that
+        # race on every CLI one-shot. A regular thread makes interpreter exit
+        # WAIT for the insert (bounded by connect_timeout + the query itself);
+        # long-lived gateway/desktop processes are unaffected either way.
+        threading.Thread(target=_work, name="pgvec-staging").start()
 
     def on_memory_write(
         self,

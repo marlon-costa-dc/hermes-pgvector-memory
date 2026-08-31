@@ -303,6 +303,22 @@ class TestStagingConnectTimeout:
         assert "connect_timeout=" in src
         assert "timeout=10" not in src.replace("connect_timeout=10", "")
 
+    def test_enqueue_thread_is_non_daemon(self):
+        """`hermes chat -q` exits right after the response; a daemon staging
+        thread dies with the process and the turn is lost. The thread must be
+        joinable at interpreter exit (non-daemon)."""
+        import inspect
+        import re
+
+        from pgvector_memory import PgVectorMemoryProvider
+
+        src = inspect.getsource(PgVectorMemoryProvider._enqueue_staging)
+        m = re.search(r"threading\.Thread\(target=_work([^)]*)\)", src)
+        assert m, "thread creation not found in _enqueue_staging"
+        assert "daemon=True" not in m.group(1), (
+            "staging thread is daemon=True: CLI one-shots lose the enqueue race"
+        )
+
 
 class TestNoiseFilter:
     def test_trivial_affirmations_filtered(self):
