@@ -47,10 +47,13 @@ class OllamaEmbedder:
         model: str = DEFAULT_MODEL,
         timeout: float = 120.0,
     ) -> None:
-        self.host = host.rstrip("/")
-        self.model = model
+        # Defensive: a caller passing None (e.g. config that resolved to a
+        # missing key) must land on the default, not crash on .rstrip() with
+        # a traceback that says nothing about the real cause.
+        self.host = (host or DEFAULT_HOST).rstrip("/")
+        self.model = model or DEFAULT_MODEL
         self.timeout = timeout
-        self._dims: int | None = KNOWN_DIMS.get(model)
+        self._dims: int | None = KNOWN_DIMS.get(self.model)
 
     @property
     def dims(self) -> int | None:

@@ -89,12 +89,22 @@ def load_config(cfg_get=None) -> Config:
     """
 
     def _cfg(key: str, default: Any = None) -> Any:
+        """Read one key, treating a missing value as absent.
+
+        Measured behaviour, not the documented one: Hermes' ``cfg_get``
+        returns ``None`` for an unset key even when a default is passed, so
+        the default must be applied here. An empty string is also treated as
+        absent — a blank DSN is never a deliberate choice.
+        """
         if cfg_get is None:
             return default
         try:
-            return cfg_get(f"plugins.pgvector-memory.{key}", default)
+            value = cfg_get(f"plugins.pgvector-memory.{key}")
         except Exception:
             return default
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default
+        return value
 
     env = os.environ.get
     return Config(

@@ -73,6 +73,31 @@ class TestConfig:
         # A memory plugin must not take the whole agent down over config.
         assert load_config(cfg_get=exploding).dsn == Config().dsn
 
+    def test_cfg_get_returning_none_falls_back_to_default(self, monkeypatch):
+        """Regression: Hermes' cfg_get returns None for an unset key.
+
+        Measured, not assumed — cfg_get('missing.key', 'default') yields None,
+        the default is NOT applied by the host. Trusting it produced
+        ollama_host=None and an AttributeError on .rstrip() at agent startup.
+        """
+        for var in list(os.environ):
+            if var.startswith("PGVECTOR_MEMORY_"):
+                monkeypatch.delenv(var, raising=False)
+
+        cfg = load_config(cfg_get=lambda key, default=None: None)
+        assert cfg.ollama_host == "http://127.0.0.1:11434"
+        assert cfg.dsn == Config().dsn
+        assert cfg.embed_model == "nomic-embed-text"
+        assert cfg.recall_limit == 5
+        assert cfg.auto_recall is True
+
+    def test_blank_config_value_is_treated_as_absent(self, monkeypatch):
+        monkeypatch.delenv("PGVECTOR_MEMORY_DSN", raising=False)
+        # A blank DSN is never a deliberate choice; falling back beats
+        # failing to connect to "".
+        cfg = load_config(cfg_get=lambda key, default=None: "   ")
+        assert cfg.dsn == Config().dsn
+
 
 class TestStoreValidation:
     def test_rejects_table_name_carrying_sql(self):
@@ -122,3 +147,11 @@ class TestEmbedderContract:
     def test_embed_empty_list_short_circuits(self):
         # Must not perform a request for an empty batch.
         assert OllamaEmbedder().embed([]) == []
+
+    def test_none_host_and_model_fall_back_to_defaults(self):
+        # Regression: config that resolved to None reached the constructor and
+        # crashed on None.rstrip() during agent startup.
+        embedder = OllamaEmbedder(host=None, model=None)  # type: ignore[arg-type]
+        assert embedder.host == "http://127.0.0.1:11434"
+        assert embedder.model == "nomic-embed-text"
+        assert embedder.dims == 768
