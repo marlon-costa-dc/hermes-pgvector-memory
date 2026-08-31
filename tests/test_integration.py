@@ -165,10 +165,26 @@ class TestSemanticSearch:
         cats = [h for h in hits if "gat" in h["content"].lower()]
         assert len(cats) == 2, f"both cat sentences should rank high: {hits}"
 
-    def test_unrelated_content_ranks_last(self, store, embedder):
+    def test_relevant_outranks_everything_irrelevant(self, store, embedder):
+        """The invariant that matters: relevant content beats irrelevant content.
+
+        Note what is NOT asserted: which irrelevant sentence lands last.
+        Measured against nomic-embed-text, that order is not stable —
+        for "gato dormindo" the bicycle scores 0.4207 and PostgreSQL 0.3956,
+        but for "gato" the bicycle scores 0.4687 and PostgreSQL 0.4034.
+        The embedder groups by linguistic register (everyday Portuguese prose
+        vs technical jargon), not by human-perceived topical distance, so the
+        bicycle sentence drifts. Asserting a total ordering would be encoding
+        a coincidence; the group separation is the real contract.
+        """
         self._seed(store, embedder)
         hits = store.search(embedder.embed_one("gato dormindo"), limit=5)
-        assert "bicicleta" in hits[-1]["content"].lower()
+        assert len(hits) == len(self.CORPUS)
+
+        cats = [h["similarity"] for h in hits if "gat" in h["content"].lower()]
+        others = [h["similarity"] for h in hits if "gat" not in h["content"].lower()]
+        assert len(cats) == 2 and len(others) == 3
+        assert min(cats) > max(others), f"cat sentences {cats} must all outrank non-cat {others}"
 
     def test_similarity_is_a_sane_cosine(self, store, embedder):
         self._seed(store, embedder)
@@ -184,6 +200,75 @@ class TestSemanticSearch:
         self._seed(store, embedder)
         hits = store.search(embedder.embed_one("E0609"), "E0609", limit=5)
         assert any("E0609" in h["content"] for h in hits)
+
+    def test_lexical_half_actually_contributes(self, store, embedder):
+        """The lexical branch must change the outcome, not merely exist.
+
+        This is the discriminating test: it compares the SAME vector query
+        with and without query_text. If the lexical half is dead -- as it was
+        when plainto_tsquery AND-ed every stopword and matched nothing -- both
+        calls return the identical ranking and this fails.
+
+        Written after three earlier regression tests turned out to pass
+        against the broken code: on a small corpus vector search alone put the
+        right document in the top 3, so they proved nothing.
+        """
+        # Deliberately unlike the corpus semantically, but sharing rare words
+        # with the query below.
+        text = "gc ROTEIA; o REPOSITORIO e dono de branch/worktree/gates/PR/merge"
+        store.add(text, embedder.embed_one(text))
+        # Pad so a lone vector ranking cannot trivially surface it.
+        for i in range(12):
+            filler = f"nota de preenchimento numero {i} sobre assuntos diversos"
+            store.add(filler, embedder.embed_one(filler))
+        self._seed(store, embedder)
+
+        question = "quem e o dono da branch e do merge?"
+        qvec = embedder.embed_one(question)
+
+        vector_only = [h["id"] for h in store.search(qvec, "", limit=5)]
+        hybrid = [h["id"] for h in store.search(qvec, question, limit=5)]
+
+        assert hybrid != vector_only, (
+            "hybrid ranking is identical to vector-only: the lexical branch "
+            f"contributed nothing. vector={vector_only} hybrid={hybrid}"
+        )
+        target = next(h for h in store.recent(limit=50) if "ROTEIA" in h["content"])
+        assert target["id"] in hybrid, (
+            f"lexically matching memory absent from hybrid results: {hybrid}"
+        )
+
+    def test_slash_separated_terms_are_searchable(self, store, embedder):
+        """Postgres reads "a/b/c" as ONE `file` token; "worktree" must hit it.
+
+        Asserted through the lexical branch alone (an unrelated vector) so a
+        passing result cannot come from semantic similarity.
+        """
+        text = "o REPOSITORIO e dono de branch/worktree/gates/PR/merge"
+        store.add(text, embedder.embed_one(text))
+        self._seed(store, embedder)
+        # Vector points at cats; only the lexical half can find "worktree".
+        unrelated = embedder.embed_one("gato dormindo no sofa")
+        hits = store.search(unrelated, "worktree", limit=3)
+        assert any("worktree" in h["content"] for h in hits), (
+            f"slash-separated token unreachable lexically: {hits}"
+        )
+
+    def test_dotted_identifier_in_query_matches_document(self, store, embedder):
+        """The query must be normalised exactly like the document.
+
+        Regression: the indexed side split "CLAUDE.md" into 'claude'+'md'
+        while the query kept 'claude.md' whole, so the lexeme matched zero
+        rows. Uses an unrelated vector so only the lexical half can succeed.
+        """
+        text = "AGENTS.md/CLAUDE.md protegidos: prompt expirado = BLOQUEIO"
+        store.add(text, embedder.embed_one(text))
+        self._seed(store, embedder)
+        unrelated = embedder.embed_one("gato dormindo no sofa")
+        hits = store.search(unrelated, "CLAUDE.md", limit=3)
+        assert any("CLAUDE.md" in h["content"] for h in hits), (
+            f"dotted identifier unreachable lexically: {hits}"
+        )
 
     def test_min_similarity_filters_weak_matches(self, store, embedder):
         self._seed(store, embedder)

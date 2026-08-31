@@ -35,9 +35,14 @@ class TestProviderContract:
         # silently orphans every existing installation's configuration.
         assert PgVectorMemoryProvider().name == "pgvector-memory"
 
-    def test_declares_three_tools(self):
+    def test_declares_four_tools(self):
         names = {s["name"] for s in PgVectorMemoryProvider().get_tool_schemas()}
-        assert names == {"pgvector_remember", "pgvector_recall", "pgvector_forget"}
+        assert names == {
+            "pgvector_remember",
+            "pgvector_recall",
+            "pgvector_forget",
+            "pgvector_synthesize",
+        }
 
     def test_tool_schemas_are_valid_openai_functions(self):
         for schema in PgVectorMemoryProvider().get_tool_schemas():

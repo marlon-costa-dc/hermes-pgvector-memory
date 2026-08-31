@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # rank 40 vs 41.
 RRF_K = 60
 
+# Expression indexed by hermes_memories_fts. Content is tokenised twice:
+# verbatim, plus a copy with punctuation turned into spaces, because the
+# Postgres parser reads "branch/worktree/gates/merge" as ONE `file` token and
+# a search for "merge" would otherwise miss it. Must stay byte-identical to
+# the index expression in sql/schema.sql or the planner cannot use the index.
+_FTS_EXPR = "to_tsvector('simple', {col} || ' ' || translate({col}, '/_-.:', '     '))"
+
 
 class StoreError(RuntimeError):
     """Raised for unrecoverable storage problems (bad config, missing deps)."""
@@ -50,7 +57,8 @@ class MemoryStore:
         if not table.replace("_", "").isalnum():
             raise StoreError(f"Invalid table name: {table!r}")
         self.table = table
-        self._lock = threading.Lock()
+        # Reentrant: add() holds the lock while calling supersede_by_key().
+        self._lock = threading.RLock()
         self._conn = None
 
     # -- connection ---------------------------------------------------------
@@ -148,6 +156,11 @@ class MemoryStore:
         session_id: str = "",
         agent_identity: str = "",
         metadata: dict[str, Any] | None = None,
+        specific_context: str = "",
+        tags: list[str] | None = None,
+        subject: str = "",
+        relation: str = "",
+        object: str = "",
     ) -> int | None:
         """Insert one memory. Returns its id, or None when it was a duplicate.
 
@@ -164,12 +177,35 @@ class MemoryStore:
 
         conn = self._require_conn()
         with self._lock, conn.cursor() as cur:
+            # A second LIVE memory holding the same structural key with a
+            # different value means the key's holder must be retired first
+            # (defensive: the promote path normally supersedes explicitly).
+            # Retire-then-insert keeps the fact-key unique constraint happy
+            # WITHOUT deleting anything.
+            retired = None
+            if subject and relation:
+                cur.execute(
+                    f"SELECT id, object FROM {self.table}"
+                    f" WHERE coalesce(agent_identity, '') = %s"
+                    f"   AND subject = %s AND relation = %s"
+                    f"   AND superseded_at IS NULL LIMIT 1",
+                    (agent_identity or "", subject, relation),
+                )
+                row = cur.fetchone()
+                if row and row[1] != (object or ""):
+                    retired = row[0]
+                    # Retire BEFORE the insert: the partial unique index
+                    # hermes_memories_fact_key admits one live row per key.
+                    # by_id=None: the successor id does not exist yet; the
+                    # post-insert step below links it.
+                    self.supersede_by_key(retired, None)
             cur.execute(
                 f"""
                 INSERT INTO {self.table}
                     (content, embedding, kind, source, session_id,
-                     agent_identity, metadata, content_sha256)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     agent_identity, metadata, content_sha256,
+                     specific_context, tags, subject, relation, object)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (content_sha256, coalesce(agent_identity, ''))
                 DO NOTHING
                 RETURNING id
@@ -183,10 +219,92 @@ class MemoryStore:
                     agent_identity or None,
                     json.dumps(metadata or {}),
                     _sha256(content),
+                    specific_context or "",
+                    list(tags or []),
+                    subject or "",
+                    relation or "",
+                    object or "",
                 ),
             )
             row = cur.fetchone()
+        if row and row[0] and retired is not None:
+            with self._lock, conn.cursor() as cur2:
+                cur2.execute(
+                    f"UPDATE {self.table} SET superseded_by = %s WHERE id = %s",
+                    (row[0], retired),
+                )
         return row[0] if row else None
+
+    def supersede_by_key(self, old_id: int, by_id: int | None = None) -> bool:
+        """Retire one memory in favour of its successor. Never deletes.
+
+        Closes the old fact's validity interval, pointing it at the memory
+        that replaced it (by_id may be None when the successor does not exist
+        yet — the promote/add path links it right after inserting). Returns
+        False when old_id was already retired.
+        """
+        conn = self._require_conn()
+        sql = (
+            f"UPDATE {self.table}"
+            "   SET superseded_at = now(), superseded_by = %s"
+            " WHERE id = %s AND superseded_at IS NULL"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (by_id, old_id))
+            return cur.rowcount > 0
+
+    def live_key_hit(
+        self, agent_identity: str, subject: str, relation: str
+    ) -> tuple[int, str] | None:
+        """Return (id, object) of the live memory holding this structural key.
+
+        Used by the distill promote path: same (subject, relation) with a
+        different object means the new fact supersedes the old — deterministically,
+        with no similarity threshold and no LLM judge (MemStrata, arXiv 2606.26511).
+        """
+        conn = self._require_conn()
+        sql = (
+            f"SELECT id, object FROM {self.table}"
+            " WHERE coalesce(agent_identity, '') = %s"
+            "   AND subject = %s AND relation = %s"
+            "   AND superseded_at IS NULL"
+            " LIMIT 1"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (agent_identity or "", subject, relation))
+            row = cur.fetchone()
+        return (row[0], row[1]) if row else None
+
+    def get(self, memory_id: int) -> dict[str, Any] | None:
+        conn = self._require_conn()
+        sql = (
+            f"SELECT id, content, kind, source, session_id, agent_identity,"
+            f" metadata, specific_context, tags, subject, relation,"
+            f" object, superseded_at, superseded_by"
+            f" FROM {self.table} WHERE id = %s"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (memory_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        keys = (
+            "id",
+            "content",
+            "kind",
+            "source",
+            "session_id",
+            "agent_identity",
+            "metadata",
+            "specific_context",
+            "tags",
+            "subject",
+            "relation",
+            "object",
+            "superseded_at",
+            "superseded_by",
+        )
+        return dict(zip(keys, row, strict=True))
 
     def delete(self, memory_id: int) -> bool:
         conn = self._require_conn()
@@ -217,14 +335,18 @@ class MemoryStore:
 
         # Build the optional filter as a predicate (never a bare WHERE) so it
         # can be AND-ed into any position without rewriting the statement.
-        preds, params = ["TRUE"], []
+        # Two variants: unqualified, and qualified for the aliased CTE.
+        preds, qual_preds, params = ["TRUE"], ["TRUE"], []
         if kind:
             preds.append("kind = %s")
+            qual_preds.append("m.kind = %s")
             params.append(kind)
         if agent_identity:
             preds.append("agent_identity = %s")
+            qual_preds.append("m.agent_identity = %s")
             params.append(agent_identity)
         filter_sql = " AND ".join(preds)
+        qual_filter_sql = " AND ".join(qual_preds)
 
         vec = to_pgvector(query_embedding)
         # Over-fetch per branch so fusion has candidates to work with: a row
@@ -232,8 +354,36 @@ class MemoryStore:
         pool = max(limit * 5, 50)
 
         if query_text.strip():
+            fts_doc = _FTS_EXPR.format(col="m.content")
+            # Two bugs this replaces, both measured on the real corpus:
+            #
+            # 1. plainto_tsquery ANDs every term and the 'simple' config
+            #    strips no stopwords, so "quem e o dono da branch" became
+            #    'quem' & 'e' & 'o' & 'dono' & 'da' & 'branch' and matched
+            #    nothing at all. An OR of the lexemes is what makes
+            #    natural-language recall work; ts_rank still rewards
+            #    documents matching more of them.
+            #
+            # 2. The query must be normalised EXACTLY like the document, or
+            #    the halves disagree: the indexed side splits "CLAUDE.md"
+            #    into 'claude'+'md', while a raw query keeps 'claude.md' as
+            #    one lexeme that then matches zero rows.
+            #
+            # Single-character lexemes are dropped: in 'simple' every
+            # stopword survives, and "o" alone matched 12 of 23 rows here,
+            # drowning the terms that carry meaning.
+            fts_query = (
+                "to_tsquery('simple', array_to_string(ARRAY("
+                "  SELECT lex FROM unnest(tsvector_to_array("
+                f"    {_FTS_EXPR.format(col='%s')}"
+                "  )) AS lex WHERE length(lex) > 1"
+                "), ' | '))"
+            )
             sql = f"""
-            WITH vector_hits AS (
+            WITH lexical_query AS (
+                SELECT {fts_query} AS q
+            ),
+            vector_hits AS (
                 SELECT id, row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank
                   FROM {self.table}
                  WHERE {filter_sql}
@@ -241,13 +391,12 @@ class MemoryStore:
                  LIMIT {pool}
             ),
             lexical_hits AS (
-                SELECT id, row_number() OVER (
-                           ORDER BY ts_rank(to_tsvector('simple', content),
-                                            plainto_tsquery('simple', %s)) DESC
+                SELECT m.id, row_number() OVER (
+                           ORDER BY ts_rank({fts_doc}, lq.q) DESC
                        ) AS rank
-                  FROM {self.table}
-                 WHERE {filter_sql}
-                   AND to_tsvector('simple', content) @@ plainto_tsquery('simple', %s)
+                  FROM {self.table} m, lexical_query lq
+                 WHERE {qual_filter_sql}
+                   AND {_FTS_EXPR.format(col="m.content")} @@ lq.q
                  LIMIT {pool}
             ),
             fused AS (
@@ -266,12 +415,14 @@ class MemoryStore:
              LIMIT %s
             """
             args = [
+                # _FTS_EXPR interpolates {col} twice, so the query text is
+                # bound twice in the lexical_query CTE.
+                query_text,
+                query_text,
                 vec,
                 *params,  # vector_hits: rank window + filter
-                vec,  #              ORDER BY
-                query_text,
-                *params,  # lexical_hits: ts_rank + filter
-                query_text,  #               @@ predicate
+                vec,  # ORDER BY
+                *params,  # lexical_hits filter
                 vec,
                 vec,
                 min_similarity,

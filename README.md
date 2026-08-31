@@ -158,6 +158,13 @@ Tests resolve the host ABC from a real Hermes checkout when present (`HERMES_AGE
 
 Vector width is fixed at table creation. Pointing the plugin at a model of a different dimension is refused at startup with an explicit error rather than silently corrupting recall. To switch, dump the content, drop the table, and re-embed.
 
+## Contributing
+
+Branching model, definition of done, and test layers: [CONTRIBUTING.md](CONTRIBUTING.md).
+Release history: [CHANGELOG.md](CHANGELOG.md).
+
+PRs target `develop`. Only releases and hotfixes touch `main`.
+
 ## License
 
 MIT

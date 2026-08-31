@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,31 @@ class TestConfig:
         # A memory plugin must not take the whole agent down over config.
         assert load_config(cfg_get=exploding).dsn == Config().dsn
 
+    def test_cfg_get_returning_none_falls_back_to_default(self, monkeypatch):
+        """Regression: Hermes' cfg_get returns None for an unset key.
+
+        Measured, not assumed — cfg_get('missing.key', 'default') yields None,
+        the default is NOT applied by the host. Trusting it produced
+        ollama_host=None and an AttributeError on .rstrip() at agent startup.
+        """
+        for var in list(os.environ):
+            if var.startswith("PGVECTOR_MEMORY_"):
+                monkeypatch.delenv(var, raising=False)
+
+        cfg = load_config(cfg_get=lambda key, default=None: None)
+        assert cfg.ollama_host == "http://127.0.0.1:11434"
+        assert cfg.dsn == Config().dsn
+        assert cfg.embed_model == "nomic-embed-text"
+        assert cfg.recall_limit == 5
+        assert cfg.auto_recall is True
+
+    def test_blank_config_value_is_treated_as_absent(self, monkeypatch):
+        monkeypatch.delenv("PGVECTOR_MEMORY_DSN", raising=False)
+        # A blank DSN is never a deliberate choice; falling back beats
+        # failing to connect to "".
+        cfg = load_config(cfg_get=lambda key, default=None: "   ")
+        assert cfg.dsn == Config().dsn
+
 
 class TestStoreValidation:
     def test_rejects_table_name_carrying_sql(self):
@@ -122,3 +148,253 @@ class TestEmbedderContract:
     def test_embed_empty_list_short_circuits(self):
         # Must not perform a request for an empty batch.
         assert OllamaEmbedder().embed([]) == []
+
+    def test_none_host_and_model_fall_back_to_defaults(self):
+        # Regression: config that resolved to None reached the constructor and
+        # crashed on None.rstrip() during agent startup.
+        embedder = OllamaEmbedder(host=None, model=None)  # type: ignore[arg-type]
+        assert embedder.host == "http://127.0.0.1:11434"
+        assert embedder.model == "nomic-embed-text"
+        assert embedder.dims == 768
+
+
+class TestStagingEnqueue:
+    """capture_mode='staging': turns go to distill_prompts, never live."""
+
+    class _SentinelStore:
+        """Type-compatible stand-in: capture only checks initialization."""
+
+    def _provider(self, tmp_path, **cfg_overrides):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        cfg = Config(**cfg_overrides)
+        provider = PgVectorMemoryProvider(cfg)
+        # Type-true uninitialized instance: capture gates on _store not None.
+        provider._store = MemoryStore.__new__(MemoryStore)
+        return provider
+
+    def test_sync_turn_enqueues_to_staging(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="staging", dsn="postgresql:///x"
+        )
+        recorded = []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(
+                (prompt, origin, session_id)
+            ),
+        )
+        provider.sync_turn(
+            "Como configuro a porta do gateway?",
+            "A porta e 8372, configurada no city.toml.",
+            session_id="s1",
+        )
+        assert len(recorded) == 1
+        prompt, origin, sid = recorded[0]
+        assert origin == "hermes"
+        assert sid == "s1"
+        assert "8372" in prompt and "gateway" in prompt
+
+    def test_sync_turn_trivial_user_text_is_not_enqueued(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="staging", dsn="postgresql:///x"
+        )
+        recorded = []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
+        )
+        provider.sync_turn("ok continue", "Right, moving on to the next step.", session_id="s1")
+        assert recorded == []
+
+    def test_sync_turn_live_mode_keeps_v02_behaviour(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="live", dsn="postgresql:///x"
+        )
+        enqueued, stored = [], []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
+        )
+        monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
+        provider.sync_turn(
+            "Configure o systemd unit do hermes-gateway agora",
+            "Feito, o unit esta ativo e habilitado no boot.",
+            session_id="s1",
+        )
+        # live mode writes from a daemon thread; give it a moment.
+        for _ in range(50):
+            if stored:
+                break
+            time.sleep(0.02)
+        assert enqueued == []
+        assert len(stored) == 1
+
+    def test_capture_off_enqueues_nothing(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="off", dsn="postgresql:///x"
+        )
+        enqueued, stored = [], []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
+        )
+        monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
+        provider.sync_turn(
+            "Long enough user message about infra.", "Long enough assistant reply.", session_id="s"
+        )
+        assert enqueued == [] and stored == []
+
+    def test_on_pre_compress_enqueues_transcript(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x")
+        recorded = []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append((prompt, origin)),
+        )
+        msgs = [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "qual a porta do api server?"},
+            {"role": "assistant", "content": "8642, autenticada."},
+            {"role": "tool", "content": "tool output"},
+        ]
+        provider.on_pre_compress(msgs)
+        assert any("8642" in p for p, _ in recorded)
+        assert all(o == "hermes" for _, o in recorded)
+
+    def test_on_pre_compress_never_raises(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x")
+
+        def exploding(*a, **kw):
+            raise RuntimeError("pg down")
+
+        monkeypatch.setattr(provider, "_enqueue_staging", exploding)
+        # Best-effort contract: compression must proceed regardless.
+        assert provider.on_pre_compress([{"role": "user", "content": "x"}]) == ""
+
+    def test_short_transcript_not_enqueued(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x", min_turn_chars=500)
+        recorded = []
+        monkeypatch.setattr(
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
+        )
+        provider.on_pre_compress([{"role": "user", "content": "tiny"}])
+        assert recorded == []
+
+
+class TestNoiseFilter:
+    def test_trivial_affirmations_filtered(self):
+        from pgvector_memory import _is_noisy_user_text
+
+        assert _is_noisy_user_text("ok")
+        assert _is_noisy_user_text("Ok, continue.")
+        assert _is_noisy_user_text("continue")
+        assert _is_noisy_user_text("?")
+        assert _is_noisy_user_text("valeu")
+
+    def test_substantive_text_passes(self):
+        from pgvector_memory import _is_noisy_user_text
+
+        assert not _is_noisy_user_text("Como configuro o gateway?")
+        assert not _is_noisy_user_text("roda os testes de integracao")
+        assert not _is_noisy_user_text("why did the deploy fail?")
+
+
+class TestSynthesizeToolAndIdentity:
+    def _provider(self, **cfg_overrides):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+        from pgvector_memory.store import MemoryStore
+
+        cfg = Config(**cfg_overrides)
+        p = PgVectorMemoryProvider(cfg)
+        p._store = MemoryStore.__new__(MemoryStore)
+        return p
+
+    def test_four_tool_schemas(self):
+        p = self._provider()
+        names = [s["name"] for s in p.get_tool_schemas()]
+        assert names == [
+            "pgvector_remember",
+            "pgvector_recall",
+            "pgvector_forget",
+            "pgvector_synthesize",
+        ]
+
+    def test_recall_accepts_identity_and_cross_identity_args(self):
+        """cross_identity=True widens the search to ALL identities."""
+        p = self._provider(dsn="postgresql:///x")
+        captured = {}
+
+        def fake_search(query, *, limit=10, kind="", min_similarity=None, agent_identity=None):
+            captured["agent_identity"] = agent_identity
+            return []
+
+        p._search = fake_search  # type: ignore[method-assign]
+        p.handle_tool_call(
+            "pgvector_recall",
+            {
+                "query": "gateway",
+                "identity": "work",
+                "cross_identity": True,
+            },
+        )
+        assert captured["agent_identity"] == ""  # all identities
+
+        captured.clear()
+        p.handle_tool_call("pgvector_recall", {"query": "gateway", "identity": "work"})
+        assert captured["agent_identity"] == "work"  # scoped
+
+    def test_remember_accepts_identity(self):
+        p = self._provider(dsn="postgresql:///x")
+        captured = {}
+
+        def fake_store_now(content, **kw):
+            captured.update(kw)
+            return 42
+
+        p._store_now = fake_store_now  # type: ignore[method-assign]
+        out = p.handle_tool_call(
+            "pgvector_remember",
+            {
+                "content": "fato",
+                "identity": "work",
+            },
+        )
+        assert "42" in out
+        assert captured.get("agent_identity") == "work"
+
+    def test_synthesize_tool_requires_ready_store(self):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        p = PgVectorMemoryProvider(Config(dsn="postgresql:///x"))
+        out = p.handle_tool_call("pgvector_synthesize", {"topic": "x"})
+        assert "not initialized" in out
+
+    def test_related_ids_appended_to_recall_output(self):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        p = PgVectorMemoryProvider(Config(dsn="postgresql:///x"))
+        hits = [
+            {
+                "id": 7,
+                "kind": "observation",
+                "similarity": 0.9,
+                "content": "digest",
+                "metadata": {"member_ids": [1, 2, 3]},
+            },
+            {"id": 8, "kind": "fact", "similarity": 0.8, "content": "plain"},
+        ]
+        lines = [p._format_hit(h) for h in hits]
+        assert "related: [1, 2, 3]" in lines[0]
+        assert "related" not in lines[1]

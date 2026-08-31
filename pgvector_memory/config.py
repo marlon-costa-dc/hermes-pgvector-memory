@@ -40,6 +40,11 @@ class Config:
     auto_capture_turns: bool = False
     # Skip turns shorter than this -- "ok", "thanks", "sim" carry no recall value.
     min_turn_chars: int = 80
+    # Where auto-captured turns land. 'staging' enqueues into distill_prompts so
+    # only distilled, reviewed facts reach the live table (index memories, not
+    # messages). 'live' is the v0.2 behaviour: raw turns in hermes_memories.
+    # 'off' discards captured turns entirely.
+    capture_mode: str = "staging"  # 'staging' | 'live' | 'off'
 
     # Mirror built-in MEMORY.md / USER.md writes into Postgres.
     mirror_memory_tool: bool = True
@@ -55,6 +60,7 @@ class Config:
             "min_similarity": self.min_similarity,
             "auto_capture_turns": self.auto_capture_turns,
             "min_turn_chars": self.min_turn_chars,
+            "capture_mode": self.capture_mode,
             "mirror_memory_tool": self.mirror_memory_tool,
         }
 
@@ -89,12 +95,22 @@ def load_config(cfg_get=None) -> Config:
     """
 
     def _cfg(key: str, default: Any = None) -> Any:
+        """Read one key, treating a missing value as absent.
+
+        Measured behaviour, not the documented one: Hermes' ``cfg_get``
+        returns ``None`` for an unset key even when a default is passed, so
+        the default must be applied here. An empty string is also treated as
+        absent — a blank DSN is never a deliberate choice.
+        """
         if cfg_get is None:
             return default
         try:
-            return cfg_get(f"plugins.pgvector-memory.{key}", default)
+            value = cfg_get(f"plugins.pgvector-memory.{key}")
         except Exception:
             return default
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default
+        return value
 
     env = os.environ.get
     return Config(
@@ -108,5 +124,6 @@ def load_config(cfg_get=None) -> Config:
         min_similarity=_as_float(_cfg("min_similarity"), 0.55),
         auto_capture_turns=_as_bool(_cfg("auto_capture_turns"), False),
         min_turn_chars=_as_int(_cfg("min_turn_chars"), 80),
+        capture_mode=env("PGVECTOR_MEMORY_CAPTURE_MODE") or _cfg("capture_mode", "staging"),
         mirror_memory_tool=_as_bool(_cfg("mirror_memory_tool"), True),
     )
