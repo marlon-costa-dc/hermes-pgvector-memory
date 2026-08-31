@@ -57,7 +57,8 @@ class MemoryStore:
         if not table.replace("_", "").isalnum():
             raise StoreError(f"Invalid table name: {table!r}")
         self.table = table
-        self._lock = threading.Lock()
+        # Reentrant: add() holds the lock while calling supersede_by_key().
+        self._lock = threading.RLock()
         self._conn = None
 
     # -- connection ---------------------------------------------------------
@@ -176,6 +177,28 @@ class MemoryStore:
 
         conn = self._require_conn()
         with self._lock, conn.cursor() as cur:
+            # A second LIVE memory holding the same structural key with a
+            # different value means the key's holder must be retired first
+            # (defensive: the promote path normally supersedes explicitly).
+            # Retire-then-insert keeps the fact-key unique constraint happy
+            # WITHOUT deleting anything.
+            retired = None
+            if subject and relation:
+                cur.execute(
+                    f"SELECT id, object FROM {self.table}"
+                    f" WHERE coalesce(agent_identity, '') = %s"
+                    f"   AND subject = %s AND relation = %s"
+                    f"   AND superseded_at IS NULL LIMIT 1",
+                    (agent_identity or "", subject, relation),
+                )
+                row = cur.fetchone()
+                if row and row[1] != (object or ""):
+                    retired = row[0]
+                    # Retire BEFORE the insert: the partial unique index
+                    # hermes_memories_fact_key admits one live row per key.
+                    # by_id=None: the successor id does not exist yet; the
+                    # post-insert step below links it.
+                    self.supersede_by_key(retired, None)
             cur.execute(
                 f"""
                 INSERT INTO {self.table}
@@ -204,14 +227,21 @@ class MemoryStore:
                 ),
             )
             row = cur.fetchone()
+        if row and row[0] and retired is not None:
+            with self._lock, conn.cursor() as cur2:
+                cur2.execute(
+                    f"UPDATE {self.table} SET superseded_by = %s WHERE id = %s",
+                    (row[0], retired),
+                )
         return row[0] if row else None
 
-    def supersede_by_key(self, old_id: int, by_id: int) -> bool:
+    def supersede_by_key(self, old_id: int, by_id: int | None = None) -> bool:
         """Retire one memory in favour of its successor. Never deletes.
 
-        Closes the old fact's validity interval and points it at the memory
-        that replaced it, so "as of when" questions stay answerable and the
-        change is auditable. Returns False when old_id was already retired.
+        Closes the old fact's validity interval, pointing it at the memory
+        that replaced it (by_id may be None when the successor does not exist
+        yet — the promote/add path links it right after inserting). Returns
+        False when old_id was already retired.
         """
         conn = self._require_conn()
         sql = (
