@@ -184,9 +184,7 @@ class TestSemanticSearch:
         cats = [h["similarity"] for h in hits if "gat" in h["content"].lower()]
         others = [h["similarity"] for h in hits if "gat" not in h["content"].lower()]
         assert len(cats) == 2 and len(others) == 3
-        assert min(cats) > max(others), (
-            f"cat sentences {cats} must all outrank non-cat {others}"
-        )
+        assert min(cats) > max(others), f"cat sentences {cats} must all outrank non-cat {others}"
 
     def test_similarity_is_a_sane_cosine(self, store, embedder):
         self._seed(store, embedder)
