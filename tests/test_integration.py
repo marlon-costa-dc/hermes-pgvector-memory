@@ -165,10 +165,28 @@ class TestSemanticSearch:
         cats = [h for h in hits if "gat" in h["content"].lower()]
         assert len(cats) == 2, f"both cat sentences should rank high: {hits}"
 
-    def test_unrelated_content_ranks_last(self, store, embedder):
+    def test_relevant_outranks_everything_irrelevant(self, store, embedder):
+        """The invariant that matters: relevant content beats irrelevant content.
+
+        Note what is NOT asserted: which irrelevant sentence lands last.
+        Measured against nomic-embed-text, that order is not stable —
+        for "gato dormindo" the bicycle scores 0.4207 and PostgreSQL 0.3956,
+        but for "gato" the bicycle scores 0.4687 and PostgreSQL 0.4034.
+        The embedder groups by linguistic register (everyday Portuguese prose
+        vs technical jargon), not by human-perceived topical distance, so the
+        bicycle sentence drifts. Asserting a total ordering would be encoding
+        a coincidence; the group separation is the real contract.
+        """
         self._seed(store, embedder)
         hits = store.search(embedder.embed_one("gato dormindo"), limit=5)
-        assert "bicicleta" in hits[-1]["content"].lower()
+        assert len(hits) == len(self.CORPUS)
+
+        cats = [h["similarity"] for h in hits if "gat" in h["content"].lower()]
+        others = [h["similarity"] for h in hits if "gat" not in h["content"].lower()]
+        assert len(cats) == 2 and len(others) == 3
+        assert min(cats) > max(others), (
+            f"cat sentences {cats} must all outrank non-cat {others}"
+        )
 
     def test_similarity_is_a_sane_cosine(self, store, embedder):
         self._seed(store, embedder)
