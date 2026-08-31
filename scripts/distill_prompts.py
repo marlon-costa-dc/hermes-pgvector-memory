@@ -338,14 +338,14 @@ def _ollama_chat(base: str, model: str, prompt: str, json_mode: bool) -> str:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            # qwen3 defaults to thinking mode, which emitted 3000+ reasoning
+            # tokens before the JSON (measured: 10+ min per batch at 5 t/s).
+            # The template honours the API flag; disabling it took the same
+            # call from ~10 min to ~2 min, most of it the 4B reading the
+            # prompts. Models without thinking support ignore the flag.
+            "think": False,
             **({"format": "json"} if json_mode else {}),
-            "options": {
-                "temperature": 0.1,
-                # qwen3's thinking mode will happily emit 3000+ reasoning
-                # tokens before the JSON (measured: 10+ min per batch at
-                # 5 t/s). Cap the output hard; the JSON itself is small.
-                "num_predict": 700,
-            },
+            "options": {"temperature": 0.1, "num_predict": 700},
         }
     ).encode()
     req = urllib.request.Request(

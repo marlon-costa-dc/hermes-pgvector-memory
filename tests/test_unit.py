@@ -216,7 +216,11 @@ class TestStagingEnqueue:
             lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
         )
         monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
-        provider.sync_turn("Configure o systemd unit", "Feito, o unit esta ativo.", session_id="s1")
+        provider.sync_turn(
+            "Configure o systemd unit do hermes-gateway agora",
+            "Feito, o unit esta ativo e habilitado no boot.",
+            session_id="s1",
+        )
         # live mode writes from a daemon thread; give it a moment.
         for _ in range(50):
             if stored:
