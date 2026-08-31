@@ -16,7 +16,7 @@ go through the same promote path with dedupe and triple-key supersession.
 Idempotent: an identical digest hash is a no-op, and synthesis never seeds a
 new synthesis (source <> 'synthesis' in the seed query) so themes cannot cascade.
 
-    python3 scripts/synthesize.py [--dsn ...] [--ollama ...] [--model qwen3:4b]
+    python3 scripts/synthesize.py [--dsn ...] [--ollama ...] [--model phi4-mini]
                                   [--thresh 0.82] [--min-size 3] [--limit 400]
                                   [--dry-run]
 """
@@ -39,7 +39,7 @@ from distill_prompts import (  # noqa: E402
     _strip_fences,
 )
 
-DISTILL_MODEL_DEFAULT = "qwen3:4b"
+DISTILL_MODEL_DEFAULT = "phi4-mini"
 
 THEME_SEEDS_SQL = """
 WITH seeds AS (
