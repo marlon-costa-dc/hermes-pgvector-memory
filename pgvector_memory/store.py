@@ -57,7 +57,8 @@ class MemoryStore:
         if not table.replace("_", "").isalnum():
             raise StoreError(f"Invalid table name: {table!r}")
         self.table = table
-        self._lock = threading.Lock()
+        # Reentrant: add() holds the lock while calling supersede_by_key().
+        self._lock = threading.RLock()
         self._conn = None
 
     # -- connection ---------------------------------------------------------
@@ -155,6 +156,11 @@ class MemoryStore:
         session_id: str = "",
         agent_identity: str = "",
         metadata: dict[str, Any] | None = None,
+        specific_context: str = "",
+        tags: list[str] | None = None,
+        subject: str = "",
+        relation: str = "",
+        object: str = "",
     ) -> int | None:
         """Insert one memory. Returns its id, or None when it was a duplicate.
 
@@ -171,12 +177,35 @@ class MemoryStore:
 
         conn = self._require_conn()
         with self._lock, conn.cursor() as cur:
+            # A second LIVE memory holding the same structural key with a
+            # different value means the key's holder must be retired first
+            # (defensive: the promote path normally supersedes explicitly).
+            # Retire-then-insert keeps the fact-key unique constraint happy
+            # WITHOUT deleting anything.
+            retired = None
+            if subject and relation:
+                cur.execute(
+                    f"SELECT id, object FROM {self.table}"
+                    f" WHERE coalesce(agent_identity, '') = %s"
+                    f"   AND subject = %s AND relation = %s"
+                    f"   AND superseded_at IS NULL LIMIT 1",
+                    (agent_identity or "", subject, relation),
+                )
+                row = cur.fetchone()
+                if row and row[1] != (object or ""):
+                    retired = row[0]
+                    # Retire BEFORE the insert: the partial unique index
+                    # hermes_memories_fact_key admits one live row per key.
+                    # by_id=None: the successor id does not exist yet; the
+                    # post-insert step below links it.
+                    self.supersede_by_key(retired, None)
             cur.execute(
                 f"""
                 INSERT INTO {self.table}
                     (content, embedding, kind, source, session_id,
-                     agent_identity, metadata, content_sha256)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     agent_identity, metadata, content_sha256,
+                     specific_context, tags, subject, relation, object)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (content_sha256, coalesce(agent_identity, ''))
                 DO NOTHING
                 RETURNING id
@@ -190,10 +219,92 @@ class MemoryStore:
                     agent_identity or None,
                     json.dumps(metadata or {}),
                     _sha256(content),
+                    specific_context or "",
+                    list(tags or []),
+                    subject or "",
+                    relation or "",
+                    object or "",
                 ),
             )
             row = cur.fetchone()
+        if row and row[0] and retired is not None:
+            with self._lock, conn.cursor() as cur2:
+                cur2.execute(
+                    f"UPDATE {self.table} SET superseded_by = %s WHERE id = %s",
+                    (row[0], retired),
+                )
         return row[0] if row else None
+
+    def supersede_by_key(self, old_id: int, by_id: int | None = None) -> bool:
+        """Retire one memory in favour of its successor. Never deletes.
+
+        Closes the old fact's validity interval, pointing it at the memory
+        that replaced it (by_id may be None when the successor does not exist
+        yet — the promote/add path links it right after inserting). Returns
+        False when old_id was already retired.
+        """
+        conn = self._require_conn()
+        sql = (
+            f"UPDATE {self.table}"
+            "   SET superseded_at = now(), superseded_by = %s"
+            " WHERE id = %s AND superseded_at IS NULL"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (by_id, old_id))
+            return cur.rowcount > 0
+
+    def live_key_hit(
+        self, agent_identity: str, subject: str, relation: str
+    ) -> tuple[int, str] | None:
+        """Return (id, object) of the live memory holding this structural key.
+
+        Used by the distill promote path: same (subject, relation) with a
+        different object means the new fact supersedes the old — deterministically,
+        with no similarity threshold and no LLM judge (MemStrata, arXiv 2606.26511).
+        """
+        conn = self._require_conn()
+        sql = (
+            f"SELECT id, object FROM {self.table}"
+            " WHERE coalesce(agent_identity, '') = %s"
+            "   AND subject = %s AND relation = %s"
+            "   AND superseded_at IS NULL"
+            " LIMIT 1"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (agent_identity or "", subject, relation))
+            row = cur.fetchone()
+        return (row[0], row[1]) if row else None
+
+    def get(self, memory_id: int) -> dict[str, Any] | None:
+        conn = self._require_conn()
+        sql = (
+            f"SELECT id, content, kind, source, session_id, agent_identity,"
+            f" metadata, specific_context, tags, subject, relation,"
+            f" object, superseded_at, superseded_by"
+            f" FROM {self.table} WHERE id = %s"
+        )
+        with self._lock, conn.cursor() as cur:
+            cur.execute(sql, (memory_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        keys = (
+            "id",
+            "content",
+            "kind",
+            "source",
+            "session_id",
+            "agent_identity",
+            "metadata",
+            "specific_context",
+            "tags",
+            "subject",
+            "relation",
+            "object",
+            "superseded_at",
+            "superseded_by",
+        )
+        return dict(zip(keys, row, strict=True))
 
     def delete(self, memory_id: int) -> bool:
         conn = self._require_conn()

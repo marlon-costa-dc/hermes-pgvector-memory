@@ -1,5 +1,5 @@
 name: pgvector-memory
-version: "0.2.0"
+version: "0.3.0"
 description: "PostgreSQL memory provider — pgvector + pgvectorscale DiskANN, embeddings served locally by Ollama."
 author: Marlon Costa <marlon.costa@datacosmos.com.br>
 homepage: https://github.com/marlon-costa-dc/hermes-pgvector-memory
