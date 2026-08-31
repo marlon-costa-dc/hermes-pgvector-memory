@@ -15,6 +15,9 @@ serving `nomic-embed-text`.
 
 ### Added
 
+- Release-hygiene tests (`tests/test_release.py`): the version is declared in
+  three files that nothing reconciles at runtime, so a release that bumps two
+  of the three would ship a package whose self-reported version is wrong.
 - `MemoryProvider` implementation for Hermes Agent, backed by PostgreSQL.
 - Hybrid retrieval: DiskANN vector ranking fused with lexical `tsvector`
   ranking via Reciprocal Rank Fusion (k=60). Vector search alone misses exact
