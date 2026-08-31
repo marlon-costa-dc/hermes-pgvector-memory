@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -155,3 +156,137 @@ class TestEmbedderContract:
         assert embedder.host == "http://127.0.0.1:11434"
         assert embedder.model == "nomic-embed-text"
         assert embedder.dims == 768
+
+
+class TestStagingEnqueue:
+    """capture_mode='staging': turns go to distill_prompts, never live."""
+
+    class _SentinelStore:
+        """Type-compatible stand-in: capture only checks initialization."""
+
+    def _provider(self, tmp_path, **cfg_overrides):
+        from pgvector_memory import PgVectorMemoryProvider
+        from pgvector_memory.config import Config
+
+        cfg = Config(**cfg_overrides)
+        provider = PgVectorMemoryProvider(cfg)
+        # Type-true uninitialized instance: capture gates on _store not None.
+        provider._store = MemoryStore.__new__(MemoryStore)
+        return provider
+
+    def test_sync_turn_enqueues_to_staging(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="staging", dsn="postgresql:///x"
+        )
+        recorded = []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append((prompt, origin, session_id)),
+        )
+        provider.sync_turn(
+            "Como configuro a porta do gateway?",
+            "A porta e 8372, configurada no city.toml.",
+            session_id="s1",
+        )
+        assert len(recorded) == 1
+        prompt, origin, sid = recorded[0]
+        assert origin == "hermes"
+        assert sid == "s1"
+        assert "8372" in prompt and "gateway" in prompt
+
+    def test_sync_turn_trivial_user_text_is_not_enqueued(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="staging", dsn="postgresql:///x"
+        )
+        recorded = []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
+        )
+        provider.sync_turn("ok continue", "Right, moving on to the next step.", session_id="s1")
+        assert recorded == []
+
+    def test_sync_turn_live_mode_keeps_v02_behaviour(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="live", dsn="postgresql:///x"
+        )
+        enqueued, stored = [], []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
+        )
+        monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
+        provider.sync_turn("Configure o systemd unit", "Feito, o unit esta ativo.", session_id="s1")
+        # live mode writes from a daemon thread; give it a moment.
+        for _ in range(50):
+            if stored:
+                break
+            time.sleep(0.02)
+        assert enqueued == []
+        assert len(stored) == 1
+
+    def test_capture_off_enqueues_nothing(self, monkeypatch, tmp_path):
+        provider = self._provider(
+            tmp_path, auto_capture_turns=True, capture_mode="off", dsn="postgresql:///x"
+        )
+        enqueued, stored = [], []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
+        )
+        monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
+        provider.sync_turn("Long enough user message about infra.", "Long enough assistant reply.", session_id="s")
+        assert enqueued == [] and stored == []
+
+    def test_on_pre_compress_enqueues_transcript(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x")
+        recorded = []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append((prompt, origin)),
+        )
+        msgs = [
+            {"role": "system", "content": "sys prompt"},
+            {"role": "user", "content": "qual a porta do api server?"},
+            {"role": "assistant", "content": "8642, autenticada."},
+            {"role": "tool", "content": "tool output"},
+        ]
+        provider.on_pre_compress(msgs)
+        assert any("8642" in p for p, _ in recorded)
+        assert all(o == "hermes" for _, o in recorded)
+
+    def test_on_pre_compress_never_raises(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x")
+        def exploding(*a, **kw):
+            raise RuntimeError("pg down")
+        monkeypatch.setattr(provider, "_enqueue_staging", exploding)
+        # Best-effort contract: compression must proceed regardless.
+        assert provider.on_pre_compress([{"role": "user", "content": "x"}]) == ""
+
+    def test_short_transcript_not_enqueued(self, monkeypatch, tmp_path):
+        provider = self._provider(tmp_path, dsn="postgresql:///x", min_turn_chars=500)
+        recorded = []
+        monkeypatch.setattr(
+            provider, "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
+        )
+        provider.on_pre_compress([{"role": "user", "content": "tiny"}])
+        assert recorded == []
+
+
+class TestNoiseFilter:
+    def test_trivial_affirmations_filtered(self):
+        from pgvector_memory import _is_noisy_user_text
+
+        assert _is_noisy_user_text("ok")
+        assert _is_noisy_user_text("Ok, continue.")
+        assert _is_noisy_user_text("continue")
+        assert _is_noisy_user_text("?")
+        assert _is_noisy_user_text("valeu")
+
+    def test_substantive_text_passes(self):
+        from pgvector_memory import _is_noisy_user_text
+
+        assert not _is_noisy_user_text("Como configuro o gateway?")
+        assert not _is_noisy_user_text("roda os testes de integracao")
+        assert not _is_noisy_user_text("why did the deploy fail?")

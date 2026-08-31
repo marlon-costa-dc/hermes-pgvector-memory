@@ -19,7 +19,9 @@ Config in $HERMES_HOME/config.yaml:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import threading
 from typing import Any
 
@@ -274,18 +276,79 @@ class PgVectorMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Optionally capture the turn, then queue recall for the next one."""
+        """Capture the turn per capture_mode, then queue recall for the next one."""
         if self.config.auto_capture_turns and self._store is not None:
             text = f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}"
-            if len(text) >= self.config.min_turn_chars:
-                threading.Thread(
-                    target=self._store_safe,
-                    args=(text,),
-                    kwargs={"kind": "turn", "source": "turn", "session_id": session_id},
-                    daemon=True,
-                    name="pgvec-capture",
-                ).start()
+            if len(text) >= self.config.min_turn_chars and not _is_noisy_user_text(user_content):
+                mode = (self.config.capture_mode or "staging").strip().lower()
+                if mode == "staging":
+                    self._enqueue_staging(text, origin="hermes", session_id=session_id)
+                elif mode == "live":
+                    # v0.2 behaviour preserved: raw turn into the live table.
+                    threading.Thread(
+                        target=self._store_safe,
+                        args=(text,),
+                        kwargs={"kind": "turn", "source": "turn", "session_id": session_id},
+                        daemon=True,
+                        name="pgvec-capture",
+                    ).start()
+                # 'off': deliberately discarded.
         self.queue_prefetch(user_content, session_id=session_id)
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        """Save the transcript about to be compacted away (best-effort, API v1).
+
+        The host treats this hook as best-effort: an exception here must never
+        block compression. Idempotent — distill_prompts UNIQUE(prompt_sha256)
+        absorbs the overlapping transcripts a retried compaction re-sends.
+        Returns "" (no checkpoint claim): the fail-closed v2 contract is a
+        deliberate follow-up, not attempted here.
+        """
+        try:
+            if self._store is None:
+                return ""
+            lines = [
+                f"{m.get('role', '?')}: {str(m.get('content') or '').strip()}"
+                for m in (messages or [])
+                if str(m.get("content") or "").strip()
+            ]
+            text = "\n".join(lines)
+            if len(text) >= self.config.min_turn_chars:
+                self._enqueue_staging(text, origin="hermes")
+        except Exception:
+            logger.exception("on_pre_compress staging enqueue failed (best-effort)")
+        return ""
+
+    def _enqueue_staging(
+        self, prompt: str, *, origin: str = "hermes", session_id: str = ""
+    ) -> None:
+        """Insert one turn into distill_prompts on a background thread.
+
+        Idempotent via prompt_sha256 UNIQUE. Creates the table on first use.
+        Failures are logged, never raised: capture must not break the turn.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        digest = hashlib.sha256(prompt.encode("utf-8")).digest()
+        dsn = self.config.dsn
+
+        def _work() -> None:
+            try:
+                import psycopg
+
+                # psycopg's connection context manager commits on clean exit
+                # and closes the connection; no manual close needed.
+                with psycopg.connect(dsn, timeout=10) as conn, conn.cursor() as cur:
+                    cur.execute(_STAGING_DDL)
+                    cur.execute(
+                        _STAGING_INSERT,
+                        (origin, "sync_turn", session_id or "", prompt, len(prompt), digest),
+                    )
+            except Exception as exc:
+                logger.warning("pgvector-memory staging enqueue failed: %s", exc)
+
+        threading.Thread(target=_work, daemon=True, name="pgvec-staging").start()
 
     def on_memory_write(
         self,
@@ -503,9 +566,63 @@ class PgVectorMemoryProvider(MemoryProvider):
             cfg_set(f"plugins.pgvector-memory.{key}", value)
 
 
+_NOISE_WORDS = frozenset(
+    {
+        "ok", "okay", "valeu", "valews", "blz", "beleza", "obrigado", "obrigada",
+        "thanks", "thank", "you", "thx", "continue", "continua", "prossegue",
+        "go", "ahead", "proceed", "keep", "going", "sim", "nao", "não",
+        "yes", "no", "yep", "nope", "sure", "done", "certo", "k", "kk", "hm",
+        "hmm", "e", "aí", "ai", "vai", "va",
+    }
+)
+
+
+def _is_noisy_user_text(text: str | None) -> bool:
+    """True when the user turn carries no distillable signal.
+
+    Complements the host's ``is_trivial_prompt`` with Portuguese affirmations
+    and bare punctuation. A turn is noise when it is punctuation-only or EVERY
+    word is a filler ("Ok, continue." is noise; "continue o deploy" is not).
+    Length is enforced separately (min_turn_chars).
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not re.search(r"\w", stripped):
+        return True  # bare punctuation: "?", "...", "!?"
+    words = re.findall(r"\w+", stripped.lower())
+    return bool(words) and all(w in _NOISE_WORDS for w in words)
+
+
+# v0.3 staging ingestion: the distill_prompts table owned by
+# scripts/distill_prompts.py. Created on demand so a plugin running against a
+# database that never saw the distill script still works.
+_STAGING_DDL = """
+CREATE TABLE IF NOT EXISTS distill_prompts (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    origin      text        NOT NULL,
+    source_file text        NOT NULL,
+    session_key text        NOT NULL DEFAULT '',
+    ts          timestamptz,
+    prompt      text        NOT NULL,
+    chars       int         NOT NULL,
+    prompt_sha256 bytea     NOT NULL UNIQUE,
+    embedding   vector(768),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+_STAGING_INSERT = """
+INSERT INTO distill_prompts
+    (origin, source_file, session_key, prompt, chars, prompt_sha256)
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT (prompt_sha256) DO NOTHING
+"""
+
+
 def register(ctx) -> None:
     """Plugin entry point called by Hermes' provider loader."""
     ctx.register_memory_provider(PgVectorMemoryProvider())
 
 
-__all__ = ["PgVectorMemoryProvider", "register", "__version__"]
+__all__ = ["PgVectorMemoryProvider", "register", "__version__", "_is_noisy_user_text"]

@@ -339,7 +339,13 @@ def _ollama_chat(base: str, model: str, prompt: str, json_mode: bool) -> str:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             **({"format": "json"} if json_mode else {}),
-            "options": {"temperature": 0.1},
+            "options": {
+                "temperature": 0.1,
+                # qwen3's thinking mode will happily emit 3000+ reasoning
+                # tokens before the JSON (measured: 10+ min per batch at
+                # 5 t/s). Cap the output hard; the JSON itself is small.
+                "num_predict": 700,
+            },
         }
     ).encode()
     req = urllib.request.Request(
@@ -356,13 +362,14 @@ Extract DURABLE facts about the operator, their environment, preferences and
 conventions that would still matter months later. Ignore one-off task
 details, file contents and anything re-derivable from the machine.
 
-Return JSON: {"memories": [{"content": "...", "kind": "fact|preference|observation",
-"prompt_indexes": [0,1]}]}
+/no_think
+Return JSON and NOTHING else: {"memories": [{"content": "...", "kind":
+"fact|preference|observation", "prompt_indexes": [0,1]}]}
 - content: ONE self-contained declarative sentence in the operator's language.
 - kind: fact = objective/durable, preference = how they want things done,
   observation = weaker notice.
 - prompt_indexes: indexes of the prompts supporting it.
-- If nothing durable is present, return {"memories": []}.
+- Maximum 4 memories. If nothing durable is present, return {"memories": []}.
 
 Prompts:
 {prompts}
