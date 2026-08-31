@@ -163,3 +163,55 @@ class TestPromoteDecision:
         )
         assert decision in ("skip", "insert")
         assert old_id is None
+
+
+class TestClusterCandidates:
+    def test_similar_candidates_merge(self):
+        from distill_prompts import _cluster_candidates
+
+        cands = [
+            {"core": "a", "embedding": [0.99, 0.1], "prompt_ids": [1]},
+            {"core": "b", "embedding": [0.98, 0.1], "prompt_ids": [2]},
+            {"core": "c", "embedding": [0.1, 0.99], "prompt_ids": [3]},
+        ]
+        clusters = _cluster_candidates(cands, thresh=0.90)
+        assert len(clusters) == 2
+        merged = [c for c in clusters if len(c["prompt_ids"]) == 2][0]
+        assert sorted(merged["prompt_ids"]) == [1, 2]
+
+    def test_merged_cluster_keeps_longest_core(self):
+        from distill_prompts import _cluster_candidates
+
+        cands = [
+            {"core": "curto", "embedding": [1.0, 0.0], "prompt_ids": [1]},
+            {"core": "um core bem mais longo e detalhado aqui", "embedding": [0.99, 0.01], "prompt_ids": [2]},
+        ]
+        clusters = _cluster_candidates(cands, thresh=0.90)
+        assert len(clusters) == 1
+        assert clusters[0]["core"] == "um core bem mais longo e detalhado aqui"
+
+    def test_fields_union_across_cluster(self):
+        from distill_prompts import _cluster_candidates
+
+        cands = [
+            {"core": "a", "embedding": [1.0, 0.0], "prompt_ids": [1],
+             "specific_context": "ctx-a", "tags": ["x"], "subject": "", "relation": "", "object": "", "kind": "fact"},
+            {"core": "b", "embedding": [0.99, 0.0], "prompt_ids": [2],
+             "specific_context": "ctx-b", "tags": ["y"], "subject": "s", "relation": "r", "object": "o", "kind": "fact"},
+        ]
+        (merged,) = _cluster_candidates(cands, thresh=0.90)
+        assert merged["tags"] == ["x", "y"]
+        assert merged["specific_context"] in ("ctx-a", "ctx-b")
+        # a triple surviving from any member keeps supersession power
+        assert (merged["subject"], merged["relation"], merged["object"]) == ("s", "r", "o")
+
+    def test_embeddings_normalised_before_dot(self):
+        from distill_prompts import _cluster_candidates
+
+        cands = [
+            {"core": "a", "embedding": [2.0, 0.0], "prompt_ids": [1]},
+            {"core": "b", "embedding": [1.0, 0.0], "prompt_ids": [2]},
+        ]
+        # Un-normalised but colinear -> cosine 1.0 -> must merge.
+        clusters = _cluster_candidates(cands, thresh=0.90)
+        assert len(clusters) == 1

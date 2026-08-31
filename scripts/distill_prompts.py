@@ -251,6 +251,65 @@ def _parse_enrichment(raw: str) -> dict[str, Any]:
     }
 
 
+def _cluster_candidates(
+    cands: list[dict[str, Any]], thresh: float = 0.90
+) -> list[dict[str, Any]]:
+    """Greedy cosine clustering of one distill batch's candidates.
+
+    n is tiny (<= 4 per batch), so O(n^2) greedy is right and a real
+    clustering dependency would be wrong. The first (oldest) member of a
+    cluster donates the record shape; the LONGEST core wins (most detail);
+    tags union; specific_context keeps the first non-empty; a triple from any
+    member survives, so supersession power is not lost to a merge.
+    """
+    def _norm(v: list[float]) -> list[float]:
+        mag = sum(x * x for x in v) ** 0.5
+        return [x / mag for x in v] if mag else v
+
+    def _cos(a: list[float], b: list[float]) -> float:
+        a, b = _norm(a), _norm(b)
+        return sum(x * y for x, y in zip(a, b, strict=True))
+
+    clusters: list[dict[str, Any]] = []
+    for cand in sorted(cands, key=lambda c: len(str(c.get("core", "")))):
+        emb = _norm([float(x) for x in cand.get("embedding") or []])
+        for cl in clusters:
+            members = cl["_members"]
+            ref = members[0].get("_emb") or _norm([float(x) for x in members[0].get("embedding") or []])
+            if _cos(emb, ref) >= thresh:
+                members.append(cand)
+                cand["_emb"] = emb
+                break
+        else:
+            clusters.append({"_members": [cand]})
+            continue
+
+    out: list[dict[str, Any]] = []
+    for cl in clusters:
+        members: list[dict[str, Any]] = cl["_members"]
+        # Longest core already sorts last; it heads the merged record.
+        head = members[-1]
+        merged = dict(head)
+        merged["prompt_ids"] = [pid for m in members for pid in (m.get("prompt_ids") or [])]
+        tags: list[str] = []
+        for m in members:
+            for t in m.get("tags") or []:
+                if t not in tags:
+                    tags.append(t)
+        merged["tags"] = tags[:6]
+        merged["specific_context"] = next(
+            (m.get("specific_context") for m in members if m.get("specific_context")), ""
+        )
+        for m in members:
+            if m.get("subject") and m.get("relation"):
+                merged["subject"] = m["subject"]
+                merged["relation"] = m["relation"]
+                merged["object"] = m.get("object", "")
+                break
+        out.append(merged)
+    return out
+
+
 def _promote_decision(
     *,
     subject: str,
@@ -620,21 +679,31 @@ def cmd_distill(args: argparse.Namespace) -> None:
             conn.commit()
             continue
 
+        # Pre-cluster this batch's memories: two candidates about the same
+        # thing become one row with united evidence, before they ever reach
+        # distilled_candidates.
+        raw_cands: list[dict[str, Any]] = []
+        for mem in parsed.get("memories") or []:
+            if not isinstance(mem, dict):
+                continue
+            fields = _parse_enrichment(json.dumps(mem))
+            if not fields["core"]:
+                continue
+            idxs = [
+                pairs[i][0]
+                for i in mem.get("prompt_indexes") or []
+                if isinstance(i, int) and 0 <= i < len(pairs)
+            ]
+            if not idxs:
+                continue
+            fields["prompt_ids"] = idxs
+            raw_cands.append(fields)
+        clusters = _cluster_candidates(raw_cands, thresh=0.90)
+
         kept = 0
         with conn.cursor() as cur:
-            for mem in parsed.get("memories") or []:
-                if not isinstance(mem, dict):
-                    continue
-                fields = _parse_enrichment(json.dumps(mem))
-                if not fields["core"]:
-                    continue
-                idxs = [
-                    pairs[i][0]
-                    for i in mem.get("prompt_indexes") or []
-                    if isinstance(i, int) and 0 <= i < len(pairs)
-                ]
-                if not idxs:
-                    continue
+            for fields in clusters:
+                idxs = fields["prompt_ids"]
                 origin = "mixed"
                 with conn.cursor() as c2:
                     c2.execute(
@@ -649,8 +718,8 @@ def cmd_distill(args: argparse.Namespace) -> None:
                         """
                         INSERT INTO distilled_candidates
                             (content, kind, origin, prompt_ids, content_sha256, model,
-                             core, specific_context, tags)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             core, specific_context, tags, subject, relation, object)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (content_sha256) DO NOTHING
                         """,
                         (
@@ -663,6 +732,9 @@ def cmd_distill(args: argparse.Namespace) -> None:
                             fields["core"],
                             fields["specific_context"],
                             fields["tags"],
+                            fields.get("subject", ""),
+                            fields.get("relation", ""),
+                            fields.get("object", ""),
                         ),
                     )
                     kept += 1
