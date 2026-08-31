@@ -180,8 +180,11 @@ class TestStagingEnqueue:
         )
         recorded = []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
-            lambda prompt, *, origin="hermes", session_id="": recorded.append((prompt, origin, session_id)),
+            provider,
+            "_enqueue_staging",
+            lambda prompt, *, origin="hermes", session_id="": recorded.append(
+                (prompt, origin, session_id)
+            ),
         )
         provider.sync_turn(
             "Como configuro a porta do gateway?",
@@ -200,7 +203,8 @@ class TestStagingEnqueue:
         )
         recorded = []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
+            provider,
+            "_enqueue_staging",
             lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
         )
         provider.sync_turn("ok continue", "Right, moving on to the next step.", session_id="s1")
@@ -212,7 +216,8 @@ class TestStagingEnqueue:
         )
         enqueued, stored = [], []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
+            provider,
+            "_enqueue_staging",
             lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
         )
         monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
@@ -235,18 +240,22 @@ class TestStagingEnqueue:
         )
         enqueued, stored = [], []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
+            provider,
+            "_enqueue_staging",
             lambda prompt, *, origin="hermes", session_id="": enqueued.append(prompt),
         )
         monkeypatch.setattr(provider, "_store_safe", lambda content, **kw: stored.append(content))
-        provider.sync_turn("Long enough user message about infra.", "Long enough assistant reply.", session_id="s")
+        provider.sync_turn(
+            "Long enough user message about infra.", "Long enough assistant reply.", session_id="s"
+        )
         assert enqueued == [] and stored == []
 
     def test_on_pre_compress_enqueues_transcript(self, monkeypatch, tmp_path):
         provider = self._provider(tmp_path, dsn="postgresql:///x")
         recorded = []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
+            provider,
+            "_enqueue_staging",
             lambda prompt, *, origin="hermes", session_id="": recorded.append((prompt, origin)),
         )
         msgs = [
@@ -261,8 +270,10 @@ class TestStagingEnqueue:
 
     def test_on_pre_compress_never_raises(self, monkeypatch, tmp_path):
         provider = self._provider(tmp_path, dsn="postgresql:///x")
+
         def exploding(*a, **kw):
             raise RuntimeError("pg down")
+
         monkeypatch.setattr(provider, "_enqueue_staging", exploding)
         # Best-effort contract: compression must proceed regardless.
         assert provider.on_pre_compress([{"role": "user", "content": "x"}]) == ""
@@ -271,7 +282,8 @@ class TestStagingEnqueue:
         provider = self._provider(tmp_path, dsn="postgresql:///x", min_turn_chars=500)
         recorded = []
         monkeypatch.setattr(
-            provider, "_enqueue_staging",
+            provider,
+            "_enqueue_staging",
             lambda prompt, *, origin="hermes", session_id="": recorded.append(prompt),
         )
         provider.on_pre_compress([{"role": "user", "content": "tiny"}])

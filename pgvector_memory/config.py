@@ -124,7 +124,6 @@ def load_config(cfg_get=None) -> Config:
         min_similarity=_as_float(_cfg("min_similarity"), 0.55),
         auto_capture_turns=_as_bool(_cfg("auto_capture_turns"), False),
         min_turn_chars=_as_int(_cfg("min_turn_chars"), 80),
-        capture_mode=env("PGVECTOR_MEMORY_CAPTURE_MODE")
-        or _cfg("capture_mode", "staging"),
+        capture_mode=env("PGVECTOR_MEMORY_CAPTURE_MODE") or _cfg("capture_mode", "staging"),
         mirror_memory_tool=_as_bool(_cfg("mirror_memory_tool"), True),
     )

@@ -84,6 +84,19 @@ ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAUL
 ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
 ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS superseded_by bigint REFERENCES hermes_memories(id);
 
+-- Deterministic supersession key (MemStrata, arXiv 2606.26511): a memory that
+-- asserts a mutable value (version, port, flag, path) carries a (subject,
+-- relation, object) triple. At most ONE live memory per (identity, subject,
+-- relation): a new object supersedes the old by key — never by similarity,
+-- which cannot tell a contradiction from a duplicate. Empty subject = no key.
+-- MUST come after superseded_at exists: the predicate references it.
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS subject text NOT NULL DEFAULT '';
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS relation text NOT NULL DEFAULT '';
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS object text NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS hermes_memories_fact_key
+    ON hermes_memories (coalesce(agent_identity, ''), subject, relation)
+    WHERE superseded_at IS NULL AND subject <> '';
+
 CREATE INDEX IF NOT EXISTS hermes_memories_live
     ON hermes_memories (kind, created_at DESC) WHERE superseded_at IS NULL;
 CREATE INDEX IF NOT EXISTS hermes_memories_tags

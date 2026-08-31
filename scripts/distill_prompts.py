@@ -46,7 +46,10 @@ MIN_DISTILL_CHARS = 40
 # a 4B local model keeps producing valid JSON.
 DISTILL_BATCH = 12
 # A candidate within this cosine similarity of an existing memory is a
-# duplicate and is not promoted.
+# duplicate and is not promoted. Used ONLY for candidates WITHOUT a structural
+# triple: MemStrata (arXiv 2606.26511) measured that cosine cannot separate a
+# contradiction from a duplicate (AUROC 0.59), so similarity never retires a
+# memory — the triple key does.
 PROMOTE_MAX_SIMILARITY = 0.90
 
 SCHEMA = """
@@ -71,8 +74,20 @@ CREATE TABLE IF NOT EXISTS distilled_candidates (
     content_sha256 bytea      NOT NULL UNIQUE,
     model         text        NOT NULL,
     promoted_at   timestamptz,
+    core          text        NOT NULL DEFAULT '',
+    specific_context text     NOT NULL DEFAULT '',
+    tags          text[]      NOT NULL DEFAULT '{}',
+    subject       text        NOT NULL DEFAULT '',
+    relation      text        NOT NULL DEFAULT '',
+    object        text        NOT NULL DEFAULT '',
     created_at    timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS core text NOT NULL DEFAULT '';
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS specific_context text NOT NULL DEFAULT '';
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}';
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS subject text NOT NULL DEFAULT '';
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS relation text NOT NULL DEFAULT '';
+ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS object text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS distill_progress (
     batch_key text        PRIMARY KEY,
     done_at   timestamptz NOT NULL DEFAULT now()
@@ -103,6 +118,162 @@ def _ensure_schema(conn) -> None:
 
 def _sha(text: str) -> bytes:
     return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def _strip_fences(raw: str) -> str:
+    """Strip a markdown code fence the model may wrap its JSON in."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1 :]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# v0.3 two-pass distillation. Pass 1 (cheap): is this prompt memory-worthy at
+# all? Pass 2: distill survivors into structured candidates. Batches group by
+# session_key so the model sees a coherent slice of one conversation instead
+# of an arbitrary id-ordered slice of many.
+# ---------------------------------------------------------------------------
+
+CLASSIFY_PROMPT = """Você classifica trechos de conversa de um dev-operador com agentes de código.
+Responda APENAS JSON: {"memory_worthy": bool, "reason": "..."}
+
+Vale memória: fato durável de ambiente/infra, preferência explícita do operador,
+decisão com motivo, lição de causa-raiz, convenção de projeto.
+NÃO vale: saudação, comando procedural ("continue"), código colado sem contexto,
+pergunta sem resposta, estado transitório de tarefa, conteúdo re-derivável da máquina.
+
+Trecho:
+"""
+
+ENRICH_PROMPT = """Abaixo estão trechos de conversa do operador. Destile MEMÓRIAS DURÁVEIS.
+Regra de vocabulário sobrevivente: reutilize os termos EXATOS da conversa
+(nomes de arquivo, flags, mensagens de erro, caminhos, versões) — nunca parafofeie.
+
+Return JSON and NOTHING else: {"memories": [{"core": "...", "specific_context": "...",
+"kind": "fact|preference|observation", "tags": ["..."],
+"subject": "...", "relation": "...", "object": "...", "prompt_indexes": [0,1]}]}
+
+- core: a memória em UMA frase autocontida, no idioma do trecho.
+- specific_context: UM detalhe discriminante, verbatim (caminho, erro, flag, valor).
+- kind: fact = objetivo/durável, preference = como o operador quer as coisas,
+  observation = notícia mais fraca. Máximo 6 tags curtas.
+- subject/relation/object: quando a memória afirma um VALOR MUTÁVEL (versão,
+  porta, caminho, flag, estado), preencha o triplo com os termos EXATOS da
+  conversa. Ex.: subject="bd (beads)", relation="versão do toolchain",
+  object="1.2.2-fd1". Sem valor mutável, strings vazias. O triplo é usado para
+  supersession determinística: quando o valor mudar, a memória antiga é
+  aposentada pela chave — seja preciso e consistente nos termos.
+- prompt_indexes: índices dos trechos que suportam a memória.
+- Máximo 4 memórias. Se nada durável, {"memories": []}.
+
+Trechos:
+"""
+
+
+def _group_batches(rows: list[tuple[str, Any]], batch_size: int) -> list[list[tuple[str, Any]]]:
+    """Group (session_key, row) pairs into batches.
+
+    Same-session rows stay together (a coherent slice of one conversation);
+    rows with an empty session_key fill leftover space; an oversized session
+    is chunked in order. Returns batches of at most ``batch_size`` pairs.
+    """
+    from collections import defaultdict
+
+    by_session: dict[str, list[Any]] = defaultdict(list)
+    loose: list[Any] = []
+    for sk, row in rows:
+        if sk:
+            by_session[sk].append(row)
+        else:
+            loose.append(row)
+
+    batches: list[list[tuple[str, Any]]] = []
+    cur: list[tuple[str, Any]] = []
+    for sk, group in by_session.items():
+        for row in group:
+            cur.append((sk, row))
+            if len(cur) >= batch_size:
+                batches.append(cur)
+                cur = []
+    for row in loose:
+        cur.append(("", row))
+        if len(cur) >= batch_size:
+            batches.append(cur)
+            cur = []
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _parse_verdict(raw: str) -> tuple[bool, str]:
+    """Parse pass-1 verdict. Unparseable fails CLOSED (not worthy)."""
+    try:
+        data = json.loads(_strip_fences(raw))
+    except json.JSONDecodeError:
+        return False, "unparseable"
+    if not isinstance(data, dict):
+        return False, "unparseable"
+    return bool(data.get("memory_worthy")), str(data.get("reason", ""))
+
+
+_VALID_KINDS = ("fact", "preference", "observation")
+
+
+def _parse_enrichment(raw: str) -> dict[str, Any]:
+    """Parse pass-2 structured output into a safe shape.
+
+    Never raises: invalid JSON yields an empty-core observation that callers
+    skip. The triple defaults to empty strings (no supersession key).
+    """
+    try:
+        data = json.loads(_strip_fences(raw))
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    kind = data.get("kind")
+    if kind not in _VALID_KINDS:
+        kind = "observation"
+    tags = [str(t) for t in (data.get("tags") or []) if isinstance(t, (str, int, float))][:6]
+    return {
+        "core": str(data.get("core", ""))[:500].strip(),
+        "specific_context": str(data.get("specific_context", ""))[:300].strip(),
+        "kind": kind,
+        "tags": tags,
+        "subject": str(data.get("subject", ""))[:200].strip(),
+        "relation": str(data.get("relation", ""))[:200].strip(),
+        "object": str(data.get("object", ""))[:200].strip(),
+    }
+
+
+def _promote_decision(
+    *,
+    subject: str,
+    relation: str,
+    obj: str,
+    live_key_hit: tuple[int, str] | None,
+    best_similarity: float = 0.0,
+) -> tuple[str, int | None]:
+    """Pure decision function for promote. Returns (decision, superseded_id).
+
+    Order matters: the structural triple decides when present; similarity is
+    a dedupe-only signal for keyless candidates and can never retire memory.
+    """
+    if subject and relation:
+        if live_key_hit is None:
+            return "insert", None
+        old_id, live_obj = live_key_hit
+        if obj == live_obj:
+            return "skip", None
+        return "supersede", old_id
+    if best_similarity >= PROMOTE_MAX_SIMILARITY:
+        return "skip", None
+    return "insert", None
 
 
 # --------------------------------------------------------------------------
@@ -203,7 +374,7 @@ def _iter_opencode(db_path: Path) -> Iterable[tuple[str, str, str | None, str]]:
                     chunk,
                 )
 
-        for mid, data in (_parts() if id_list else iter(())):
+        for mid, data in _parts() if id_list else iter(()):
             if mid not in user_msgs:
                 continue
             try:
@@ -387,41 +558,61 @@ def cmd_distill(args: argparse.Namespace) -> None:
         )[0]
     print(f"distill: {total} eligible prompts (chars >= {MIN_DISTILL_CHARS})")
 
-    offset = 0
+    # ---- Build session-coherent batches (resumable per batch key) ----
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT session_key, id, prompt FROM distill_prompts
+             WHERE chars >= %s
+             ORDER BY id
+            """,
+            (MIN_DISTILL_CHARS,),
+        )
+        rows = cur.fetchall()
+    batches = _group_batches([(r[0], (r[1], r[2])) for r in rows], DISTILL_BATCH)
+    print(f"distill: {len(batches)} batches (pass 1 classify -> pass 2 enrich)")
+
     batch_no = 0
     proposed = 0
-    while True:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, prompt FROM distill_prompts
-                 WHERE chars >= %s
-                 ORDER BY id
-                 LIMIT %s OFFSET %s
-                """,
-                (MIN_DISTILL_CHARS, DISTILL_BATCH, offset),
-            )
-            batch = cur.fetchall()
-        if not batch:
-            break
+    for batch in batches:
         batch_no += 1
-        offset += DISTILL_BATCH
-        batch_key = f"{batch[0][0]}-{batch[-1][0]}"
+        first_id, last_id = batch[0][1][0], batch[-1][1][0]
+        batch_key = f"{first_id}-{last_id}:enrich"
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM distill_progress WHERE batch_key = %s", (batch_key,))
             already = cur.fetchone()
         if already:
             continue
 
-        listing = "\n".join(f"[{i}] {p[:500]}" for i, (_pid, p) in enumerate(batch))
+        pairs = [(pid, sk, prompt) for sk, (pid, prompt) in batch]
+        listing = "\n".join(f"[{i}] {p[:500]}" for i, (_pid, _sk, p) in enumerate(pairs))
+
+        # ---- Pass 1: classify (skip batches with no signal early) ----
+        verdict_raw = _ollama_chat(
+            args.ollama,
+            args.model,
+            CLASSIFY_PROMPT + listing,
+            json_mode=True,
+        )
+        worthy, reason = _parse_verdict(verdict_raw)
+        if not worthy:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO distill_progress VALUES (%s, now())", (batch_key,))
+            conn.commit()
+            print(f"  batch {batch_no} ({first_id}-{last_id}): not worthy ({reason})", flush=True)
+            if args.batches and batch_no >= args.batches:
+                break
+            continue
+
+        # ---- Pass 2: structured enrichment ----
         raw = _ollama_chat(
             args.ollama,
             args.model,
-            DISTILL_PROMPT.replace("{prompts}", listing),
+            ENRICH_PROMPT + listing,
             json_mode=True,
         )
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(_strip_fences(raw))
         except json.JSONDecodeError:
             print(f"  batch {batch_key}: model returned invalid JSON, skipped")
             with conn.cursor() as cur:
@@ -432,16 +623,17 @@ def cmd_distill(args: argparse.Namespace) -> None:
         kept = 0
         with conn.cursor() as cur:
             for mem in parsed.get("memories") or []:
-                content = str(mem.get("content", "")).strip()
-                kind = str(mem.get("kind", "observation"))
-                if kind not in ("fact", "preference", "observation"):
-                    kind = "observation"
+                if not isinstance(mem, dict):
+                    continue
+                fields = _parse_enrichment(json.dumps(mem))
+                if not fields["core"]:
+                    continue
                 idxs = [
-                    batch[i][0]
+                    pairs[i][0]
                     for i in mem.get("prompt_indexes") or []
-                    if isinstance(i, int) and 0 <= i < len(batch)
+                    if isinstance(i, int) and 0 <= i < len(pairs)
                 ]
-                if not content or not idxs:
+                if not idxs:
                     continue
                 origin = "mixed"
                 with conn.cursor() as c2:
@@ -456,11 +648,22 @@ def cmd_distill(args: argparse.Namespace) -> None:
                     cur.execute(
                         """
                         INSERT INTO distilled_candidates
-                            (content, kind, origin, prompt_ids, content_sha256, model)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (content, kind, origin, prompt_ids, content_sha256, model,
+                             core, specific_context, tags)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (content_sha256) DO NOTHING
                         """,
-                        (content, kind, origin, idxs, _sha(content), args.model),
+                        (
+                            fields["core"],
+                            fields["kind"],
+                            origin,
+                            idxs,
+                            _sha(fields["core"]),
+                            args.model,
+                            fields["core"],
+                            fields["specific_context"],
+                            fields["tags"],
+                        ),
                     )
                     kept += 1
                 except Exception as exc:  # noqa: BLE001 — log, keep going
@@ -469,7 +672,7 @@ def cmd_distill(args: argparse.Namespace) -> None:
         conn.commit()
         proposed += kept
         print(
-            f"  batch {batch_no} ({batch_key}): {kept} candidates (total {proposed})",
+            f"  batch {batch_no} ({first_id}-{last_id}): {kept} candidates (total {proposed})",
             flush=True,
         )
         if args.batches and batch_no >= args.batches:
@@ -492,25 +695,69 @@ def cmd_promote(args: argparse.Namespace) -> None:
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, content, kind, origin, prompt_ids FROM distilled_candidates"
-            " WHERE promoted_at IS NULL ORDER BY id"
+            """
+            SELECT id, content, kind, origin, prompt_ids, core, specific_context, tags
+              FROM distilled_candidates WHERE promoted_at IS NULL ORDER BY id
+            """
         )
         pending = cur.fetchall()
     print(f"promote: {len(pending)} candidates waiting")
-    promoted = skipped_dup = 0
-    for cid, content, kind, origin, prompt_ids in pending:
+    promoted = skipped_dup = superseded = 0
+    for cid, content, kind, origin, prompt_ids, _core, spec_ctx, tags in pending:
         vec = embedder.embed_one(content)
-        existing = store.search(vec, "", limit=1, min_similarity=PROMOTE_MAX_SIMILARITY)
-        if existing:
+
+        # ---- Structural key first (MemStrata): the triple decides ----
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT subject, relation, object FROM distilled_candidates WHERE id = %s
+                """,
+                (cid,),
+            )
+            subj, rel, obj = cur.fetchone()
+
+        decision, supersede_id = "insert", None
+        live_key_hit: tuple[int, str] | None = None
+        best_similarity = 0.0
+        if subj and rel:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, object FROM hermes_memories
+                     WHERE coalesce(agent_identity, '') = '' AND subject = %s
+                       AND relation = %s AND superseded_at IS NULL
+                     LIMIT 1
+                    """,
+                    (subj, rel),
+                )
+                hit = cur.fetchone()
+            live_key_hit = (hit[0], hit[1]) if hit else None
+        else:
+            existing = store.search(vec, "", limit=1, min_similarity=PROMOTE_MAX_SIMILARITY)
+            if existing:
+                best_similarity = float(existing[0].get("similarity") or 0.0)
+        decision, supersede_id = _promote_decision(
+            subject=subj,
+            relation=rel,
+            obj=obj,
+            live_key_hit=live_key_hit,
+            best_similarity=best_similarity,
+        )
+
+        if decision == "skip":
             skipped_dup += 1
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE distilled_candidates SET promoted_at = now() WHERE id = %s",
                     (cid,),
                 )
+            conn.commit()
             continue
+
         meta = {"origin": origin, "prompt_ids": list(prompt_ids or [])}
-        store.add(
+        if spec_ctx:
+            meta["specific_context"] = spec_ctx
+        new_id = store.add(
             content,
             vec,
             kind=kind,
@@ -518,7 +765,15 @@ def cmd_promote(args: argparse.Namespace) -> None:
             session_id="distill",
             agent_identity="",
             metadata=meta,
+            specific_context=spec_ctx,
+            tags=tags,
+            subject=subj,
+            relation=rel,
+            object=obj,
         )
+        if supersede_id is not None and new_id is not None:
+            store.supersede_by_key(supersede_id, new_id)
+            superseded += 1
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE distilled_candidates SET promoted_at = now() WHERE id = %s",
@@ -526,7 +781,10 @@ def cmd_promote(args: argparse.Namespace) -> None:
             )
         conn.commit()
         promoted += 1
-    print(f"promote: {promoted} added, {skipped_dup} skipped as near-duplicates")
+    print(
+        f"promote: {promoted} added, {skipped_dup} skipped as near-duplicates, "
+        f"{superseded} superseded an older fact"
+    )
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
