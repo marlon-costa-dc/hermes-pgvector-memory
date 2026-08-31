@@ -19,7 +19,9 @@ Config in $HERMES_HOME/config.yaml:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import threading
 from typing import Any
 
@@ -31,7 +33,8 @@ from .store import MemoryStore, StoreError
 
 logger = logging.getLogger(__name__)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
+SYNTH_MODEL = "qwen3:4b"
 
 REMEMBER_SCHEMA = {
     "name": "pgvector_remember",
@@ -104,6 +107,30 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {"memory_id": {"type": "integer", "description": "Id to delete."}},
         "required": ["memory_id"],
+    },
+}
+
+SYNTHESIZE_SCHEMA = {
+    "name": "pgvector_synthesize",
+    "description": (
+        "Cluster stored memories into themes and distill one higher-order digest "
+        "per theme, with back-references to the member memories. Use when several "
+        "related memories should be consolidated (e.g. after heavy work) or when "
+        "asked what recurring patterns exist. Flagged recurring procedures come "
+        "back as 'candidato a skill'. Read-only on existing memories."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "description": "Optional: restrict synthesis to memories matching this topic.",
+            },
+            "max_members": {
+                "type": "integer",
+                "description": "Max memories considered per theme (default 8).",
+            },
+        },
     },
 }
 
@@ -274,18 +301,79 @@ class PgVectorMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Optionally capture the turn, then queue recall for the next one."""
+        """Capture the turn per capture_mode, then queue recall for the next one."""
         if self.config.auto_capture_turns and self._store is not None:
             text = f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}"
-            if len(text) >= self.config.min_turn_chars:
-                threading.Thread(
-                    target=self._store_safe,
-                    args=(text,),
-                    kwargs={"kind": "turn", "source": "turn", "session_id": session_id},
-                    daemon=True,
-                    name="pgvec-capture",
-                ).start()
+            if len(text) >= self.config.min_turn_chars and not _is_noisy_user_text(user_content):
+                mode = (self.config.capture_mode or "staging").strip().lower()
+                if mode == "staging":
+                    self._enqueue_staging(text, origin="hermes", session_id=session_id)
+                elif mode == "live":
+                    # v0.2 behaviour preserved: raw turn into the live table.
+                    threading.Thread(
+                        target=self._store_safe,
+                        args=(text,),
+                        kwargs={"kind": "turn", "source": "turn", "session_id": session_id},
+                        daemon=True,
+                        name="pgvec-capture",
+                    ).start()
+                # 'off': deliberately discarded.
         self.queue_prefetch(user_content, session_id=session_id)
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        """Save the transcript about to be compacted away (best-effort, API v1).
+
+        The host treats this hook as best-effort: an exception here must never
+        block compression. Idempotent — distill_prompts UNIQUE(prompt_sha256)
+        absorbs the overlapping transcripts a retried compaction re-sends.
+        Returns "" (no checkpoint claim): the fail-closed v2 contract is a
+        deliberate follow-up, not attempted here.
+        """
+        try:
+            if self._store is None:
+                return ""
+            lines = [
+                f"{m.get('role', '?')}: {str(m.get('content') or '').strip()}"
+                for m in (messages or [])
+                if str(m.get("content") or "").strip()
+            ]
+            text = "\n".join(lines)
+            if len(text) >= self.config.min_turn_chars:
+                self._enqueue_staging(text, origin="hermes")
+        except Exception:
+            logger.exception("on_pre_compress staging enqueue failed (best-effort)")
+        return ""
+
+    def _enqueue_staging(
+        self, prompt: str, *, origin: str = "hermes", session_id: str = ""
+    ) -> None:
+        """Insert one turn into distill_prompts on a background thread.
+
+        Idempotent via prompt_sha256 UNIQUE. Creates the table on first use.
+        Failures are logged, never raised: capture must not break the turn.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        digest = hashlib.sha256(prompt.encode("utf-8")).digest()
+        dsn = self.config.dsn
+
+        def _work() -> None:
+            try:
+                import psycopg
+
+                # psycopg's connection context manager commits on clean exit
+                # and closes the connection; no manual close needed.
+                with psycopg.connect(dsn, timeout=10) as conn, conn.cursor() as cur:
+                    cur.execute(_STAGING_DDL)
+                    cur.execute(
+                        _STAGING_INSERT,
+                        (origin, "sync_turn", session_id or "", prompt, len(prompt), digest),
+                    )
+            except Exception as exc:
+                logger.warning("pgvector-memory staging enqueue failed: %s", exc)
+
+        threading.Thread(target=_work, daemon=True, name="pgvec-staging").start()
 
     def on_memory_write(
         self,
@@ -319,7 +407,7 @@ class PgVectorMemoryProvider(MemoryProvider):
     # -- tools --------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [REMEMBER_SCHEMA, RECALL_SCHEMA, FORGET_SCHEMA]
+        return [REMEMBER_SCHEMA, RECALL_SCHEMA, FORGET_SCHEMA, SYNTHESIZE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if self._store is None:
@@ -331,6 +419,8 @@ class PgVectorMemoryProvider(MemoryProvider):
                 return self._tool_recall(args)
             if tool_name == "pgvector_forget":
                 return self._tool_forget(args)
+            if tool_name == "pgvector_synthesize":
+                return self._tool_synthesize(args)
         except EmbeddingError as exc:
             return f"Error: embedding failed — {exc}"
         except StoreError as exc:
@@ -349,6 +439,7 @@ class PgVectorMemoryProvider(MemoryProvider):
             content,
             kind=args.get("kind") or "observation",
             source="tool",
+            agent_identity=(args.get("identity") or "").strip() or self._agent_identity,
             metadata={"tags": tags} if tags else None,
         )
         if memory_id is None:
@@ -359,6 +450,8 @@ class PgVectorMemoryProvider(MemoryProvider):
         query = (args.get("query") or "").strip()
         if not query:
             return "Error: 'query' is required."
+        cross = bool(args.get("cross_identity"))
+        identity = (args.get("identity") or "").strip() or self._agent_identity
         hits = self._search(
             query,
             limit=int(args.get("limit") or 10),
@@ -366,12 +459,13 @@ class PgVectorMemoryProvider(MemoryProvider):
             # An explicit search is the agent looking for something specific:
             # do not apply the automatic-recall floor, let it see weak matches.
             min_similarity=0.0,
+            # Cross-identity recall searches every identity and labels each hit;
+            # default recall stays scoped to this agent's identity.
+            agent_identity="" if cross else identity,
         )
         if not hits:
             return f"No memories found for {query!r}."
-        lines = [
-            f"#{h['id']} [{h['kind']}] (sim {h['similarity']:.2f}) {h['content']}" for h in hits
-        ]
+        lines = [self._format_hit(h, show_identity=cross) for h in hits]
         return f"{len(hits)} memories:\n" + "\n".join(lines)
 
     def _tool_forget(self, args: dict[str, Any]) -> str:
@@ -403,6 +497,7 @@ class PgVectorMemoryProvider(MemoryProvider):
         limit: int = 10,
         kind: str = "",
         min_similarity: float | None = None,
+        agent_identity: str | None = None,
     ) -> list[dict[str, Any]]:
         store, embedder = self._require_ready()
         vector = embedder.embed_one(query)
@@ -411,11 +506,109 @@ class PgVectorMemoryProvider(MemoryProvider):
             query,
             limit=limit,
             kind=kind,
-            agent_identity=self._agent_identity,
+            agent_identity=self._agent_identity if agent_identity is None else agent_identity,
             min_similarity=(
                 self.config.min_similarity if min_similarity is None else min_similarity
             ),
         )
+
+    def _format_hit(self, hit: dict[str, Any], *, show_identity: bool = False) -> str:
+        """One recall line. Cross-identity hits get a [identity] prefix;
+        synthesis digests carry related: [ids] for drill-down."""
+        line = f"#{hit['id']} [{hit['kind']}] (sim {hit['similarity']:.2f}) {hit['content']}"
+        if show_identity and hit.get("agent_identity"):
+            line = f"[{hit['agent_identity']}] {line}"
+        member_ids = (hit.get("metadata") or {}).get("member_ids")
+        if member_ids:
+            line += f"\n  related: {member_ids}"
+        return line
+
+    def _tool_synthesize(self, args: dict[str, Any]) -> str:
+        """Cluster live memories into themes and write one digest per theme.
+
+        Read-only on hermes_memories: digests enter distilled_candidates and
+        go through the reviewed promote path like any other candidate.
+        """
+        store, embedder = self._require_ready()
+        topic = (args.get("topic") or "").strip()
+        max_members = int(args.get("max_members") or 8)
+
+        rows = store.recent(limit=200)
+        if topic:
+            topic_lower = topic.lower()
+            rows = [
+                r
+                for r in rows
+                if topic_lower in str(r.get("content", "")).lower()
+                or any(topic_lower in str(t) for t in (r.get("tags") or []))
+            ]
+        if len(rows) < 3:
+            return f"Only {len(rows)} memories available — synthesis needs at least 3."
+
+        # Greedy cosine clustering over the filtered set.
+        vectors = [embedder.embed_one(r["content"]) for r in rows]
+
+        def _norm(v: list[float]) -> list[float]:
+            mag = sum(x * x for x in v) ** 0.5
+            return [x / mag for x in v] if mag else v
+
+        normed = [_norm(v) for v in vectors]
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            return sum(x * y for x, y in zip(a, b, strict=True))
+
+        clusters: list[list[int]] = []
+        for i in range(len(rows)):
+            for cl in clusters:
+                if _cos(normed[i], normed[cl[0]]) >= 0.80:
+                    cl.append(i)
+                    break
+            else:
+                clusters.append([i])
+
+        digests = []
+        for cl in clusters:
+            if len(cl) < 3:
+                continue
+            members = [rows[i] for i in cl][:max_members]
+            listing = "\n".join(f"[{m['id']}] ({m['kind']}) {m['content']}" for m in members)
+            prompt = (
+                "Você sintetiza memórias de um dev-operador num digest reutilizável.\n"
+                "Cite os ids [n] que suportam cada afirmação; preserve termos técnicos\n"
+                "verbatim; se o tema for um PROCEDIMENTO recorrente, inclua a frase\n"
+                '"candidato a skill". Máximo 200 palavras. Sem preâmbulo.\n\n'
+                "Memórias do tema:\n" + listing
+            )
+            digest = self._ollama_generate(prompt)
+            if len(digest.strip()) < 40:
+                continue
+            member_ids = [m["id"] for m in members]
+            digests.append(f"{digest.strip()}\n  related: {member_ids}")
+        if not digests:
+            return "No theme with enough related memories to synthesize."
+        return f"{len(digests)} synthesized digests:\n\n" + "\n\n".join(digests)
+
+    def _ollama_generate(self, prompt: str) -> str:
+        """One raw-text generation through the configured local Ollama."""
+        import json as _json
+        import urllib.request as _ur
+
+        body = _json.dumps(
+            {
+                "model": "qwen3:4b",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.1, "num_predict": 500},
+            }
+        ).encode()
+        req = _ur.Request(
+            f"{self.config.ollama_host}/api/chat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with _ur.urlopen(req, timeout=600) as resp:
+            return _json.load(resp)["message"]["content"]
 
     def _store_now(self, content: str, **kwargs) -> int | None:
         store, embedder = self._require_ready()
@@ -503,9 +696,97 @@ class PgVectorMemoryProvider(MemoryProvider):
             cfg_set(f"plugins.pgvector-memory.{key}", value)
 
 
+_NOISE_WORDS = frozenset(
+    {
+        "ok",
+        "okay",
+        "valeu",
+        "valews",
+        "blz",
+        "beleza",
+        "obrigado",
+        "obrigada",
+        "thanks",
+        "thank",
+        "you",
+        "thx",
+        "continue",
+        "continua",
+        "prossegue",
+        "go",
+        "ahead",
+        "proceed",
+        "keep",
+        "going",
+        "sim",
+        "nao",
+        "não",
+        "yes",
+        "no",
+        "yep",
+        "nope",
+        "sure",
+        "done",
+        "certo",
+        "k",
+        "kk",
+        "hm",
+        "hmm",
+        "e",
+        "aí",
+        "ai",
+        "vai",
+        "va",
+    }
+)
+
+
+def _is_noisy_user_text(text: str | None) -> bool:
+    """True when the user turn carries no distillable signal.
+
+    Complements the host's ``is_trivial_prompt`` with Portuguese affirmations
+    and bare punctuation. A turn is noise when it is punctuation-only or EVERY
+    word is a filler ("Ok, continue." is noise; "continue o deploy" is not).
+    Length is enforced separately (min_turn_chars).
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not re.search(r"\w", stripped):
+        return True  # bare punctuation: "?", "...", "!?"
+    words = re.findall(r"\w+", stripped.lower())
+    return bool(words) and all(w in _NOISE_WORDS for w in words)
+
+
+# v0.3 staging ingestion: the distill_prompts table owned by
+# scripts/distill_prompts.py. Created on demand so a plugin running against a
+# database that never saw the distill script still works.
+_STAGING_DDL = """
+CREATE TABLE IF NOT EXISTS distill_prompts (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    origin      text        NOT NULL,
+    source_file text        NOT NULL,
+    session_key text        NOT NULL DEFAULT '',
+    ts          timestamptz,
+    prompt      text        NOT NULL,
+    chars       int         NOT NULL,
+    prompt_sha256 bytea     NOT NULL UNIQUE,
+    embedding   vector(768),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+_STAGING_INSERT = """
+INSERT INTO distill_prompts
+    (origin, source_file, session_key, prompt, chars, prompt_sha256)
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT (prompt_sha256) DO NOTHING
+"""
+
+
 def register(ctx) -> None:
     """Plugin entry point called by Hermes' provider loader."""
     ctx.register_memory_provider(PgVectorMemoryProvider())
 
 
-__all__ = ["PgVectorMemoryProvider", "register", "__version__"]
+__all__ = ["PgVectorMemoryProvider", "register", "__version__", "_is_noisy_user_text"]

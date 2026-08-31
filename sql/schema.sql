@@ -66,3 +66,51 @@ CREATE INDEX IF NOT EXISTS hermes_memories_created_at
 
 CREATE INDEX IF NOT EXISTS hermes_memories_kind
     ON hermes_memories (kind, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- v0.3 migration (idempotent): enrichment, supersession, staging ingestion.
+-- ADD COLUMN IF NOT EXISTS keeps this safe on fresh AND existing installs.
+-- ---------------------------------------------------------------------------
+
+-- Structured-distillation fields (paper arXiv 2603.13017): the core states
+-- what was decided; specific_context carries ONE discriminating detail
+-- (error string, file path, flag) with vocabulary kept verbatim from the
+-- source conversation, because that is what later queries match.
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS specific_context text NOT NULL DEFAULT '';
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}';
+
+-- Supersession: a contradicted memory is never deleted; it is marked and
+-- pointed at its successor. "Now" queries filter superseded_at IS NULL.
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS superseded_at timestamptz;
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS superseded_by bigint REFERENCES hermes_memories(id);
+
+-- Deterministic supersession key (MemStrata, arXiv 2606.26511): a memory that
+-- asserts a mutable value (version, port, flag, path) carries a (subject,
+-- relation, object) triple. At most ONE live memory per (identity, subject,
+-- relation): a new object supersedes the old by key — never by similarity,
+-- which cannot tell a contradiction from a duplicate. Empty subject = no key.
+-- MUST come after superseded_at exists: the predicate references it.
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS subject text NOT NULL DEFAULT '';
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS relation text NOT NULL DEFAULT '';
+ALTER TABLE hermes_memories ADD COLUMN IF NOT EXISTS object text NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS hermes_memories_fact_key
+    ON hermes_memories (coalesce(agent_identity, ''), subject, relation)
+    WHERE superseded_at IS NULL AND subject <> '';
+
+CREATE INDEX IF NOT EXISTS hermes_memories_live
+    ON hermes_memories (kind, created_at DESC) WHERE superseded_at IS NULL;
+CREATE INDEX IF NOT EXISTS hermes_memories_tags
+    ON hermes_memories USING gin (tags);
+
+-- Enrichment fields on candidates (written by distill pass 2, read by promote).
+-- distilled_candidates is owned by scripts/distill_prompts.py (_ensure_schema),
+-- so only migrate it when it exists: a fresh install creates it with these
+-- columns already in place.
+DO $$
+BEGIN
+    IF to_regclass('distilled_candidates') IS NOT NULL THEN
+        ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS core text NOT NULL DEFAULT '';
+        ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS specific_context text NOT NULL DEFAULT '';
+        ALTER TABLE distilled_candidates ADD COLUMN IF NOT EXISTS tags text[] NOT NULL DEFAULT '{}';
+    END IF;
+END $$;

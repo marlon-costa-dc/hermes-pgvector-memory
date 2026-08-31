@@ -7,6 +7,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-31
+
+Memory pipeline v0.3: ingest, enrich, dedupe, synthesize, cross-memory.
+
+### Added
+- `capture_mode` config (`staging` default): `sync_turn` enqueues conversation
+  turns into `distill_prompts` instead of writing raw turns into the live
+  table; `live` preserves v0.2 behaviour; `off` discards.
+- `on_pre_compress` hook: the transcript about to be compacted away is staged
+  for distillation before the lossy summary (best-effort, idempotent by hash).
+- Two-pass distillation: cheap classify pass, then structured enrichment
+  (core + specific_context + tags, surviving-vocabulary rule), session-
+  coherent batches, resumable `:enrich` batch keys.
+- Intra-batch candidate clustering: same-topic candidates merge with united
+  evidence before reaching `distilled_candidates`.
+- Deterministic supersession (MemStrata, arXiv 2606.26511): mutable-value
+  memories carry a (subject, relation, object) triple; a new object retires
+  the old by key — never by similarity (cosine cannot separate contradiction
+  from duplicate: AUROC 0.59). `superseded_at`/`superseded_by` keep the
+  bi-temporal ledger queryable; recall filters retired memories by default.
+- `pgvector_synthesize` tool + `scripts/synthesize.py`: theme clustering over
+  live memories, digests with member back-references, procedures flagged as
+  "candidato a skill".
+- `identity` argument on remember/recall; `cross_identity` recall labels hits
+  `[identity]`.
+
+### Changed
+- `store.add` accepts specific_context/tags/subject/relation/object.
+- Version bumps to 0.3.0; fourth tool schema declared.
+
 ## [0.2.0] — 2026-08-31
 
 Migrating the operator's real `MEMORY.md` into the database and then querying
