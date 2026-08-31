@@ -290,6 +290,20 @@ class TestStagingEnqueue:
         assert recorded == []
 
 
+class TestStagingConnectTimeout:
+    def test_enqueue_uses_connect_timeout_not_bare_timeout(self):
+        """Regression: psycopg v3 rejects `timeout=` ('invalid connection
+        option') and the daemon thread swallowed the failure — staging stayed
+        empty forever. The connect call must carry connect_timeout."""
+        import inspect
+
+        from pgvector_memory import PgVectorMemoryProvider
+
+        src = inspect.getsource(PgVectorMemoryProvider._enqueue_staging)
+        assert "connect_timeout=" in src
+        assert "timeout=10" not in src.replace("connect_timeout=10", "")
+
+
 class TestNoiseFilter:
     def test_trivial_affirmations_filtered(self):
         from pgvector_memory import _is_noisy_user_text

@@ -364,7 +364,10 @@ class PgVectorMemoryProvider(MemoryProvider):
 
                 # psycopg's connection context manager commits on clean exit
                 # and closes the connection; no manual close needed.
-                with psycopg.connect(dsn, timeout=10) as conn, conn.cursor() as cur:
+                # libpq's connect timeout is connect_timeout; a bare
+                # `timeout=` is rejected by psycopg v3 ("invalid connection
+                # option") and the enqueue silently died.
+                with psycopg.connect(dsn, connect_timeout=10) as conn, conn.cursor() as cur:
                     cur.execute(_STAGING_DDL)
                     cur.execute(
                         _STAGING_INSERT,

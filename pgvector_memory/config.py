@@ -95,22 +95,34 @@ def load_config(cfg_get=None) -> Config:
     """
 
     def _cfg(key: str, default: Any = None) -> Any:
-        """Read one key, treating a missing value as absent.
+        """Read one plugin config key, treating a missing value as absent.
 
-        Measured behaviour, not the documented one: Hermes' ``cfg_get``
-        returns ``None`` for an unset key even when a default is passed, so
-        the default must be applied here. An empty string is also treated as
+        Supports BOTH host eras (measured, 2026-08-31):
+
+        - dotted-string style: ``cfg_get("plugins.pgvector-memory.key")``
+        - dict-and-keys style:  ``cfg_get(cfg_dict, "plugins", "pgvector-memory",
+          "key")`` — the signature in the current hermes-agent source
+          (``hermes_cli/config.py``), which rejects a bare string ``cfg``
+          with ``None``.
+
+        The dict form is tried first when the injected callable's first
+        parameter accepts a mapping; an unset key yields None either way, so
+        the default is applied here. An empty string is also treated as
         absent — a blank DSN is never a deliberate choice.
         """
-        if cfg_get is None:
-            return default
-        try:
-            value = cfg_get(f"plugins.pgvector-memory.{key}")
-        except Exception:
-            return default
-        if value is None or (isinstance(value, str) and not value.strip()):
-            return default
-        return value
+        dotted = f"plugins.pgvector-memory.{key}"
+        path = ("plugins", "pgvector-memory", key)
+        for call in (
+            lambda: cfg_get(dotted),                     # legacy string-keyed
+            lambda: cfg_get(*path),                      # var-keys (cfg omitted)
+        ):
+            try:
+                value = call()
+            except Exception:
+                continue
+            if value is not None and not (isinstance(value, str) and not value.strip()):
+                return value
+        return default
 
     env = os.environ.get
     return Config(
