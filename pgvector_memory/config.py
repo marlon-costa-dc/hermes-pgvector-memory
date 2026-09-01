@@ -127,7 +127,7 @@ def load_config(cfg_get=None) -> Config:
 
         for call in (
             lambda: cfg_get(dotted),  # legacy string-keyed reader
-            _dict_style,              # current host reader
+            _dict_style,  # current host reader
         ):
             try:
                 value = call()

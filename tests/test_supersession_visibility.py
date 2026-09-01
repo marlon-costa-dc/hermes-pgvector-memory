@@ -57,10 +57,22 @@ def store():
 @requires_stack
 class TestLiveFilterContract:
     def test_c1_search_excludes_superseded_by_default(self, store):
-        old = store.add("porta do api server = 8642", _vec(0.5), kind="fact",
-                        subject="api server", relation="porta", object="8642")
-        new = store.add("porta do api server = 9999", _vec(0.5), kind="fact",
-                        subject="api server", relation="porta", object="9999")
+        old = store.add(
+            "porta do api server = 8642",
+            _vec(0.5),
+            kind="fact",
+            subject="api server",
+            relation="porta",
+            object="8642",
+        )
+        new = store.add(
+            "porta do api server = 9999",
+            _vec(0.5),
+            kind="fact",
+            subject="api server",
+            relation="porta",
+            object="9999",
+        )
         store.supersede_by_key(old, new)
         hits = store.search(_vec(0.5), "porta do api server", limit=10)
         ids = {h["id"] for h in hits}
@@ -68,10 +80,22 @@ class TestLiveFilterContract:
         assert new in ids
 
     def test_c2_include_superseded_surfaces_history(self, store):
-        old = store.add("versao do bd = 1.2.2", _vec(0.4), kind="fact",
-                        subject="bd", relation="versao", object="1.2.2")
-        new = store.add("versao do bd = 1.4.1", _vec(0.4), kind="fact",
-                        subject="bd", relation="versao", object="1.4.1")
+        old = store.add(
+            "versao do bd = 1.2.2",
+            _vec(0.4),
+            kind="fact",
+            subject="bd",
+            relation="versao",
+            object="1.2.2",
+        )
+        new = store.add(
+            "versao do bd = 1.4.1",
+            _vec(0.4),
+            kind="fact",
+            subject="bd",
+            relation="versao",
+            object="1.4.1",
+        )
         store.supersede_by_key(old, new)
         hits = store.search(_vec(0.4), "versao do bd", limit=10, include_superseded=True)
         ids = {h["id"] for h in hits}
@@ -107,14 +131,15 @@ class TestLiveFilterContract:
         """Rule 2 injection: with the filter REMOVED (both rows identical), the
         same query must return BOTH rows; with the filter, only the live one.
         If both branches return the same thing, the test asserts nothing."""
-        old = store.add("gate fato", _vec(0.7), kind="fact",
-                        subject="g", relation="r", object="old")
-        new = store.add("gate fato 2", _vec(0.7), kind="fact",
-                        subject="g", relation="r", object="new")
+        old = store.add(
+            "gate fato", _vec(0.7), kind="fact", subject="g", relation="r", object="old"
+        )
+        new = store.add(
+            "gate fato 2", _vec(0.7), kind="fact", subject="g", relation="r", object="new"
+        )
         store.supersede_by_key(old, new)
         with_filter = store.search(_vec(0.7), "gate fato", limit=10)
-        without_filter = store.search(_vec(0.7), "gate fato", limit=10,
-                                      include_superseded=True)
+        without_filter = store.search(_vec(0.7), "gate fato", limit=10, include_superseded=True)
         assert len(without_filter) > len(with_filter), (
             "include_superseded=True returned the same set — the filter is not "
             "gating (vacuous contract)"
