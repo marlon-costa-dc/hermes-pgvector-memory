@@ -105,9 +105,10 @@ def load_config(cfg_get=None) -> Config:
           (``hermes_cli/config.py``), which rejects a bare string ``cfg``
           with ``None``.
 
-        The dict form is tried first when the injected callable's first
-        parameter accepts a mapping; an unset key yields None either way, so
-        the default is applied here. An empty string is also treated as
+        Both are attempted per read: dotted-string first (cheap, matches the
+        legacy reader), then the dict-and-keys form, which matches the
+        current hermes-agent signature. An unset key yields None either way,
+        so the default is applied here. An empty string is also treated as
         absent — a blank DSN is never a deliberate choice.
         """
         dotted = f"plugins.pgvector-memory.{key}"
@@ -126,8 +127,8 @@ def load_config(cfg_get=None) -> Config:
             return cfg_get(_host_load(), "plugins", "pgvector-memory", key)
 
         for call in (
-            lambda: cfg_get(dotted),  # legacy string-keyed reader
-            _dict_style,  # current host reader
+            _dict_style,  # current host reader first — the era we run in
+            lambda: cfg_get(dotted),  # legacy string-keyed reader fallback
         ):
             try:
                 value = call()

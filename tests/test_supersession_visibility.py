@@ -128,8 +128,8 @@ class TestLiveFilterContract:
         assert old in {r["id"] for r in rows_all}
 
     def test_gate_filter_actually_gates(self, store):
-        """Rule 2 injection: with the filter REMOVED (both rows identical), the
-        same query must return BOTH rows; with the filter, only the live one.
+        """Rule 2 injection: with the filter disabled, the same query must
+        return BOTH rows; with the filter, only the live one.
         If both branches return the same thing, the test asserts nothing."""
         old = store.add(
             "gate fato", _vec(0.7), kind="fact", subject="g", relation="r", object="old"
