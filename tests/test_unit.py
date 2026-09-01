@@ -290,6 +290,36 @@ class TestStagingEnqueue:
         assert recorded == []
 
 
+class TestStagingConnectTimeout:
+    def test_enqueue_uses_connect_timeout_not_bare_timeout(self):
+        """Regression: psycopg v3 rejects `timeout=` ('invalid connection
+        option') and the daemon thread swallowed the failure — staging stayed
+        empty forever. The connect call must carry connect_timeout."""
+        import inspect
+
+        from pgvector_memory import PgVectorMemoryProvider
+
+        src = inspect.getsource(PgVectorMemoryProvider._enqueue_staging)
+        assert "connect_timeout=" in src
+        assert "timeout=10" not in src.replace("connect_timeout=10", "")
+
+    def test_enqueue_thread_is_non_daemon(self):
+        """`hermes chat -q` exits right after the response; a daemon staging
+        thread dies with the process and the turn is lost. The thread must be
+        joinable at interpreter exit (non-daemon)."""
+        import inspect
+        import re
+
+        from pgvector_memory import PgVectorMemoryProvider
+
+        src = inspect.getsource(PgVectorMemoryProvider._enqueue_staging)
+        m = re.search(r"threading\.Thread\(target=_work([^)]*)\)", src)
+        assert m, "thread creation not found in _enqueue_staging"
+        assert "daemon=True" not in m.group(1), (
+            "staging thread is daemon=True: CLI one-shots lose the enqueue race"
+        )
+
+
 class TestNoiseFilter:
     def test_trivial_affirmations_filtered(self):
         from pgvector_memory import _is_noisy_user_text

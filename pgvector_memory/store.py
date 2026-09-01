@@ -323,6 +323,7 @@ class MemoryStore:
         kind: str = "",
         agent_identity: str = "",
         min_similarity: float = 0.0,
+        include_superseded: bool = False,
     ) -> list[dict[str, Any]]:
         """Hybrid search: DiskANN vector ranking fused with lexical ranking.
 
@@ -337,6 +338,11 @@ class MemoryStore:
         # can be AND-ed into any position without rewriting the statement.
         # Two variants: unqualified, and qualified for the aliased CTE.
         preds, qual_preds, params = ["TRUE"], ["TRUE"], []
+        if not include_superseded:
+            # A retired memory stays in the ledger but must not surface:
+            # recall answers "what is true NOW" (MemStrata's live-filter rule).
+            preds.append("superseded_at IS NULL")
+            qual_preds.append("m.superseded_at IS NULL")
         if kind:
             preds.append("kind = %s")
             qual_preds.append("m.kind = %s")
@@ -468,11 +474,17 @@ class MemoryStore:
                 )
         return hits
 
-    def recent(self, limit: int = 10, agent_identity: str = "") -> list[dict[str, Any]]:
+    def recent(
+        self, limit: int = 10, agent_identity: str = "", *, include_superseded: bool = False
+    ) -> list[dict[str, Any]]:
         conn = self._require_conn()
-        where, params = "", []
+        preds, params = ["TRUE"], []
         if agent_identity:
-            where, params = "WHERE agent_identity = %s", [agent_identity]
+            preds.append("agent_identity = %s")
+            params.append(agent_identity)
+        if not include_superseded:
+            preds.append("superseded_at IS NULL")
+        where = "WHERE " + " AND ".join(preds)
         with self._lock, conn.cursor() as cur:
             cur.execute(
                 f"""SELECT id, content, kind, source, created_at
