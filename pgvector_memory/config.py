@@ -105,10 +105,10 @@ def load_config(cfg_get=None) -> Config:
           (``hermes_cli/config.py``), which rejects a bare string ``cfg``
           with ``None``.
 
-        Both are attempted per read: dotted-string first (cheap, matches the
-        legacy reader), then the dict-and-keys form, which matches the
-        current hermes-agent signature. An unset key yields None either way,
-        so the default is applied here. An empty string is also treated as
+        Both are attempted per read: the dict-and-keys form first (matches
+        the current hermes-agent signature), then the dotted-string form as
+        the legacy-reader fallback. An unset key yields None either way, so
+        the default is applied here. An empty string is also treated as
         absent — a blank DSN is never a deliberate choice.
         """
         dotted = f"plugins.pgvector-memory.{key}"
