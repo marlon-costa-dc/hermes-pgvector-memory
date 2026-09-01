@@ -111,10 +111,23 @@ def load_config(cfg_get=None) -> Config:
         absent — a blank DSN is never a deliberate choice.
         """
         dotted = f"plugins.pgvector-memory.{key}"
-        path = ("plugins", "pgvector-memory", key)
+
+        def _dict_style() -> Any:
+            """Host-era reader: cfg_get(cfg_dict, *keys).
+
+            The injected callable is the host's raw ``cfg_get``, whose first
+            parameter IS the config dict — which we do not hold. Load it the
+            way the host does (lazy import keeps this module importable and
+            testable outside the agent process; the loader caches, so the
+            per-key cost is one dict traversal).
+            """
+            from hermes_cli.config import load_config as _host_load
+
+            return cfg_get(_host_load(), "plugins", "pgvector-memory", key)
+
         for call in (
-            lambda: cfg_get(dotted),                     # legacy string-keyed
-            lambda: cfg_get(*path),                      # var-keys (cfg omitted)
+            lambda: cfg_get(dotted),  # legacy string-keyed reader
+            _dict_style,              # current host reader
         ):
             try:
                 value = call()
