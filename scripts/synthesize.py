@@ -24,7 +24,6 @@ new synthesis (source <> 'synthesis' in the seed query) so themes cannot cascade
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -209,11 +208,12 @@ def main() -> None:
                     _sha(row["content"]),
                     args.model,
                     row["content"],
-                    json.dumps({"member_ids": row["member_ids"], "theme_seed": row["theme_seed"]}),
+                    # tags is text[]: pass a real Python list. The JSON string
+                    # I first used here fails as "malformed array literal".
+                    [f"member:{mid}" for mid in row["member_ids"][:12]]
+                    + [f"theme:{row['theme_seed']}"],
                 ),
             )
-            # member_ids/theme_seed live in tags+metadata path: keep them also
-            # in the tags column as machine-readable strings for promote to copy.
         conn.commit()
         proposed += 1
         print(f"  theme seed={t['seed_id']}: digest proposed ({len(digest)} chars)", flush=True)

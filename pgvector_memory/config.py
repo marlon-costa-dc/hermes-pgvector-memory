@@ -95,22 +95,48 @@ def load_config(cfg_get=None) -> Config:
     """
 
     def _cfg(key: str, default: Any = None) -> Any:
-        """Read one key, treating a missing value as absent.
+        """Read one plugin config key, treating a missing value as absent.
 
-        Measured behaviour, not the documented one: Hermes' ``cfg_get``
-        returns ``None`` for an unset key even when a default is passed, so
-        the default must be applied here. An empty string is also treated as
+        Supports BOTH host eras (measured, 2026-08-31):
+
+        - dotted-string style: ``cfg_get("plugins.pgvector-memory.key")``
+        - dict-and-keys style:  ``cfg_get(cfg_dict, "plugins", "pgvector-memory",
+          "key")`` — the signature in the current hermes-agent source
+          (``hermes_cli/config.py``), which rejects a bare string ``cfg``
+          with ``None``.
+
+        Both are attempted per read: the dict-and-keys form first (matches
+        the current hermes-agent signature), then the dotted-string form as
+        the legacy-reader fallback. An unset key yields None either way, so
+        the default is applied here. An empty string is also treated as
         absent — a blank DSN is never a deliberate choice.
         """
-        if cfg_get is None:
-            return default
-        try:
-            value = cfg_get(f"plugins.pgvector-memory.{key}")
-        except Exception:
-            return default
-        if value is None or (isinstance(value, str) and not value.strip()):
-            return default
-        return value
+        dotted = f"plugins.pgvector-memory.{key}"
+
+        def _dict_style() -> Any:
+            """Host-era reader: cfg_get(cfg_dict, *keys).
+
+            The injected callable is the host's raw ``cfg_get``, whose first
+            parameter IS the config dict — which we do not hold. Load it the
+            way the host does (lazy import keeps this module importable and
+            testable outside the agent process; the loader caches, so the
+            per-key cost is one dict traversal).
+            """
+            from hermes_cli.config import load_config as _host_load
+
+            return cfg_get(_host_load(), "plugins", "pgvector-memory", key)
+
+        for call in (
+            _dict_style,  # current host reader first — the era we run in
+            lambda: cfg_get(dotted),  # legacy string-keyed reader fallback
+        ):
+            try:
+                value = call()
+            except Exception:
+                continue
+            if value is not None and not (isinstance(value, str) and not value.strip()):
+                return value
+        return default
 
     env = os.environ.get
     return Config(

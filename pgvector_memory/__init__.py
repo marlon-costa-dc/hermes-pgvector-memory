@@ -364,7 +364,12 @@ class PgVectorMemoryProvider(MemoryProvider):
 
                 # psycopg's connection context manager commits on clean exit
                 # and closes the connection; no manual close needed.
-                with psycopg.connect(dsn, timeout=10) as conn, conn.cursor() as cur:
+                # libpq's connect timeout is connect_timeout; a bare
+                # `timeout=` is rejected by psycopg v3 ("invalid connection
+                # option") and the enqueue silently died. connect_timeout
+                # bounds only the TCP/connect handshake — the interpreter-exit
+                # wait is additionally bounded by the (fast) INSERT itself.
+                with psycopg.connect(dsn, connect_timeout=10) as conn, conn.cursor() as cur:
                     cur.execute(_STAGING_DDL)
                     cur.execute(
                         _STAGING_INSERT,
@@ -373,7 +378,12 @@ class PgVectorMemoryProvider(MemoryProvider):
             except Exception as exc:
                 logger.warning("pgvector-memory staging enqueue failed: %s", exc)
 
-        threading.Thread(target=_work, daemon=True, name="pgvec-staging").start()
+        # Non-daemon: `hermes chat -q` exits right after printing the response,
+        # and a daemon thread dies with the process — the enqueue loses that
+        # race on every CLI one-shot. A regular thread makes interpreter exit
+        # WAIT for the insert (bounded by connect_timeout + the query itself);
+        # long-lived gateway/desktop processes are unaffected either way.
+        threading.Thread(target=_work, name="pgvec-staging").start()
 
     def on_memory_write(
         self,
